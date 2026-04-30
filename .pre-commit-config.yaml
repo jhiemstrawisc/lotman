@@ -39,5 +39,5 @@ repos:
     rev: v2.3.0
     hooks:
       - id: codespell
-        args: ['--skip', '*.json,*.lock', '--ignore-words-list', 'fo,te']
+        args: ['--skip', '*.json,*.lock', '--ignore-words-list', 'fo,te,ded']
         types_or: [c++, c, cmake, markdown, yaml]

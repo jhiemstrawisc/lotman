@@ -1,9 +1,11 @@
 #include "lotman.h"
 
+#include "lotman_db.h"
 #include "lotman_internal.h"
 #include "lotman_version.h"
 #include "schemas.h"
 
+#include <chrono>
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
 #include <string.h>
@@ -17,6 +19,15 @@ std::shared_ptr<std::string> lotman::Context::m_caller = std::make_shared<std::s
 
 // Lot home
 std::shared_ptr<std::string> lotman::Context::m_home = std::make_shared<std::string>("");
+
+// Strict hierarchy enforcement (off by default for backward compatibility)
+bool lotman::Context::m_strict_hierarchy = false;
+
+// Contraction policy ("none" by default for backward compatibility)
+std::string lotman::Context::m_contraction_policy = "none";
+
+// Admin override (off by default)
+bool lotman::Context::m_admin_override = false;
 
 std::shared_ptr<int> lotman_db_timeout = std::make_shared<int>(5000); // in ms
 
@@ -72,6 +83,12 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg) {
 
 		lotman::Lot lot(lot_JSON_obj);
 
+		// Extract parent_attributions if provided
+		json parent_attributions;
+		if (lot_JSON_obj.contains("parent_attributions") && !lot_JSON_obj["parent_attributions"].is_null()) {
+			parent_attributions = lot_JSON_obj["parent_attributions"];
+		}
+
 		// Check for context and make sure caller is allowed to add the lot as specified
 		rp = lot.check_context_for_parents(lot.parents, false, true);
 		if (!rp.first) {
@@ -92,7 +109,7 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg) {
 			return -1;
 		}
 
-		rp = lot.store_lot();
+		rp = lot.store_lot(parent_attributions);
 		if (!rp.first) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -296,55 +313,57 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 			return -1;
 		}
 
-		// Start checking which keys to operate on
-		if (update_JSON_obj.contains("owner")) {
-			rp = lot.update_owner(update_JSON_obj["owner"].get<std::string>());
-			if (!rp.first) {
-				if (err_msg) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Failed on call to lot.update_owner: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
+		// Start checking which keys to operate on. All write operations are run
+		// inside a single outer storage.transaction() so the entire update is
+		// atomic: if any sub-step fails, every preceding sub-step is rolled back.
+		auto &storage = lotman::db::StorageManager::get_storage();
+		std::string txn_error;
+		bool committed = storage.transaction([&]() -> bool {
+			if (update_JSON_obj.contains("owner")) {
+				if (!lot.update_owner_in_txn(update_JSON_obj["owner"].get<std::string>(), txn_error)) {
+					txn_error = "Failed on call to lot.update_owner: " + txn_error;
+					return false;
 				}
-				return -1;
 			}
-		}
 
-		if (update_JSON_obj.contains("parents")) {
-			rp = lot.update_parents(update_JSON_obj["parents"]);
-			if (!rp.first) {
-				if (err_msg) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Failed on call to lot.update_parents";
-					*err_msg = strdup((ext_err + int_err).c_str());
+			if (update_JSON_obj.contains("parents")) {
+				if (!lot.update_parents_in_txn(update_JSON_obj["parents"], txn_error)) {
+					txn_error = "Failed on call to lot.update_parents: " + txn_error;
+					return false;
 				}
-				return -1;
 			}
-		}
 
-		if (update_JSON_obj.contains("paths")) {
-			rp = lot.update_paths(update_JSON_obj["paths"]);
-			if (!rp.first) {
-				if (err_msg) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Failed on call to lot.update_paths";
-					*err_msg = strdup((ext_err + int_err).c_str());
+			if (update_JSON_obj.contains("paths")) {
+				if (!lot.update_paths_in_txn(update_JSON_obj["paths"], txn_error)) {
+					txn_error = "Failed on call to lot.update_paths: " + txn_error;
+					return false;
 				}
-				return -1;
 			}
-		}
 
-		if (update_JSON_obj.contains("management_policy_attrs")) {
-			for (const auto &update_attr : update_JSON_obj["management_policy_attrs"].items()) {
-				auto rp = lot.update_man_policy_attrs(update_attr.key(), update_attr.value());
-				if (!rp.first) {
-					if (err_msg) {
-						std::string int_err = rp.second;
-						std::string ext_err = "Failed on call to lot.update_paths";
-						*err_msg = strdup((ext_err + int_err).c_str());
+			if (update_JSON_obj.contains("management_policy_attrs")) {
+				for (const auto &update_attr : update_JSON_obj["management_policy_attrs"].items()) {
+					if (!lot.update_man_policy_attrs_in_txn(update_attr.key(), update_attr.value(), txn_error)) {
+						txn_error = "Failed on call to lot.update_man_policy_attrs: " + txn_error;
+						return false;
 					}
-					return -1;
 				}
 			}
+
+			if (update_JSON_obj.contains("parent_attributions")) {
+				if (!lot.update_attributions_in_txn(update_JSON_obj["parent_attributions"], txn_error)) {
+					txn_error = "Failed on call to lot.update_attributions: " + txn_error;
+					return false;
+				}
+			}
+
+			return true;
+		});
+
+		if (!committed) {
+			if (err_msg) {
+				*err_msg = strdup(txn_error.empty() ? "Update transaction failed" : txn_error.c_str());
+			}
+			return -1;
 		}
 
 		return 0;
@@ -421,13 +440,27 @@ int lotman_rm_paths_from_lots(const char *lotman_JSON_str, char **err_msg) {
 		validator.set_root_schema(lotman_schemas::lot_rm_paths_schema);
 		validator.validate(subtraction_JSON_obj);
 
-		// For each path, figure out which lot it belongs to
-		// Knowing the lot name is required for context checking
+		// Phase 1 (read-only): For each path, find matching lots and check context.
+		// Collect (lot_name, path) pairs to remove.
+		struct PathRemoval {
+			std::string lot_name;
+			std::string path;
+		};
+		std::vector<PathRemoval> removals;
+
 		for (const auto &path : subtraction_JSON_obj["paths"]) {
 			std::string path_str{path.get<std::string>()};
 
-			// Check if this path actually exists in the database
-			auto rp_str_str = lotman::Lot::get_lot_from_dir(path_str);
+			// Check if this path actually exists in the database (no temporal filtering —
+			// path removal should work regardless of lot's time range)
+			std::string normalized_path = path_str;
+			if (normalized_path.empty() || normalized_path.back() != '/') {
+				normalized_path += '/';
+			}
+			std::string query = "SELECT lot_name FROM paths WHERE path = ?1;";
+			std::map<std::string, std::vector<int>> str_map{{normalized_path, {1}}};
+			std::map<int64_t, std::vector<int>> int_map;
+			auto rp_str_str = lotman::db::SQL_get_matches(query, str_map, int_map);
 			if (!rp_str_str.second.empty()) { // There was an error
 				if (err_msg) {
 					std::string int_err = rp_str_str.second;
@@ -442,29 +475,49 @@ int lotman_rm_paths_from_lots(const char *lotman_JSON_str, char **err_msg) {
 				continue;
 			}
 
-			// Initialize the lot
-			lotman::Lot lot(rp_str_str.first);
+			// The same path can appear in multiple lots (with non-overlapping time
+			// ranges), so iterate over every matching lot_name.
+			for (const auto &matching_lot_name : rp_str_str.first) {
+				lotman::Lot lot(matching_lot_name);
 
-			// Check for context
-			lot.get_parents(true, true);
-			auto rp = lot.check_context_for_parents(lot.recursive_parents, true);
-			if (!rp.first) {
-				if (err_msg) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Error while checking context for parents: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
+				// Check for context
+				lot.get_parents(true, true);
+				auto rp = lot.check_context_for_parents(lot.recursive_parents, true);
+				if (!rp.first) {
+					if (err_msg) {
+						std::string int_err = rp.second;
+						std::string ext_err = "Error while checking context for parents: ";
+						*err_msg = strdup((ext_err + int_err).c_str());
+					}
+					return -1;
 				}
-				return -1;
-			}
 
-			std::vector<std::string> plc_hldr_vec{path_str};
-			rp = lot.remove_paths(plc_hldr_vec); // Keeping std::vector<std::string> signature for now, even though it
-												 // only gets passed one thing at a time
-			if (!rp.first) {
+				removals.push_back({matching_lot_name, path_str});
+			}
+		}
+
+		// Phase 2 (write): Execute all removals in a single atomic transaction.
+		if (!removals.empty()) {
+			auto &storage = lotman::db::StorageManager::get_storage();
+			using namespace sqlite_orm;
+			std::string txn_error;
+			bool committed = storage.transaction([&] {
+				try {
+					for (const auto &rm : removals) {
+						std::string normalized = lotman::ensure_trailing_slash(rm.path);
+						storage.remove_all<lotman::db::Path>(where(c(&lotman::db::Path::lot_name) == rm.lot_name and
+																   c(&lotman::db::Path::path) == normalized));
+					}
+				} catch (const std::exception &e) {
+					txn_error = e.what();
+					return false; // rollback
+				}
+				return true;
+			});
+
+			if (!committed) {
 				if (err_msg) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Failed on call to lot.remove_paths: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
+					*err_msg = strdup(txn_error.empty() ? "Transaction failed" : txn_error.c_str());
 				}
 				return -1;
 			}
@@ -517,35 +570,49 @@ int lotman_add_to_lot(const char *lotman_JSON_str, char **err_msg) {
 			return -1;
 		}
 
-		// Start checking which keys to operate on
-		if (addition_obj.contains("parents")) {
-			std::vector<lotman::Lot> parent_lots;
-			for (const auto &parent_name : addition_obj["parents"]) {
-				lotman::Lot parent_lot(parent_name.get<std::string>());
-				parent_lots.push_back(parent_lot);
+		// Run all additions inside a single outer storage.transaction() so the
+		// envelope is atomic: a late failure (e.g. attribution validation)
+		// rolls back any preceding parent/path additions.
+		auto &storage = lotman::db::StorageManager::get_storage();
+		std::string txn_error;
+		bool committed = storage.transaction([&]() -> bool {
+			if (addition_obj.contains("parents")) {
+				std::vector<lotman::Lot> parent_lots;
+				for (const auto &parent_name : addition_obj["parents"]) {
+					lotman::Lot parent_lot(parent_name.get<std::string>());
+					parent_lots.push_back(parent_lot);
+				}
+
+				if (!lot.add_parents_in_txn(parent_lots, txn_error)) {
+					txn_error = "Failure to add parents: " + txn_error;
+					return false;
+				}
 			}
 
-			rp = lot.add_parents(parent_lots);
-			if (!rp.first) {
-				if (err_msg) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Failure to add parents: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
+			if (addition_obj.contains("paths")) {
+				if (!lot.add_paths_in_txn(addition_obj["paths"], txn_error)) {
+					txn_error = "Failure to add paths: " + txn_error;
+					return false;
 				}
-				return -1;
 			}
-		}
 
-		if (addition_obj.contains("paths")) {
-			rp = lot.add_paths(addition_obj["paths"]);
-			if (!rp.first) {
-				if (err_msg) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Failure to add paths: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
+			// `parent_attributions` runs last so any parents added above are visible
+			// when attributions are recomputed.
+			if (addition_obj.contains("parent_attributions")) {
+				if (!lot.update_attributions_in_txn(addition_obj["parent_attributions"], txn_error)) {
+					txn_error = "Failure to update parent attributions: " + txn_error;
+					return false;
 				}
-				return -1;
 			}
+
+			return true;
+		});
+
+		if (!committed) {
+			if (err_msg) {
+				*err_msg = strdup(txn_error.empty() ? "Add-to-lot transaction failed" : txn_error.c_str());
+			}
+			return -1;
 		}
 
 		return 0;
@@ -997,7 +1064,7 @@ int lotman_update_lot_usage(const char *update_JSON_str, bool deltaMode, char **
 	}
 }
 
-int lotman_update_lot_usage_by_dir(const char *update_JSON_str, bool deltaMode, char **err_msg) {
+int lotman_update_lot_usage_by_dir(const char *update_JSON_str, bool deltaMode, int64_t query_time, char **err_msg) {
 	try {
 		json update_JSON = json::parse(update_JSON_str);
 
@@ -1012,7 +1079,7 @@ int lotman_update_lot_usage_by_dir(const char *update_JSON_str, bool deltaMode, 
 			validator.validate(update);
 		}
 
-		auto rp = lotman::Lot::update_usage_by_dirs(update_JSON, deltaMode);
+		auto rp = lotman::Lot::update_usage_by_dirs(update_JSON, deltaMode, query_time);
 
 		if (!rp.first) {
 			if (err_msg) {
@@ -1202,7 +1269,7 @@ int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_ms
 }
 
 int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, char ***output,
-							 char **err_msg) {
+							 const bool hierarchical, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1214,7 +1281,7 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_opp(recursive_quota, recursive_children);
+		auto rp = lotman::Lot::get_lots_past_opp(recursive_quota, recursive_children, hierarchical);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1251,7 +1318,7 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 }
 
 int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, char ***output,
-							 char **err_msg) {
+							 const bool hierarchical, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1263,7 +1330,7 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_ded(recursive_quota, recursive_children);
+		auto rp = lotman::Lot::get_lots_past_ded(recursive_quota, recursive_children, hierarchical);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1300,7 +1367,7 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 }
 
 int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, char ***output,
-							 char **err_msg) {
+							 const bool hierarchical, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1312,7 +1379,7 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_obj(recursive_quota, recursive_children);
+		auto rp = lotman::Lot::get_lots_past_obj(recursive_quota, recursive_children, hierarchical);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1339,6 +1406,46 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 			idx++;
 		}
 		*output = past_obj_lots_c;
+		return 0;
+	} catch (std::exception &exc) {
+		if (err_msg) {
+			*err_msg = strdup(exc.what());
+		}
+		return -1;
+	}
+}
+
+int lotman_get_available_capacity(const char *parent_lot_name, int64_t start_time, int64_t end_time, char **output,
+								  char **err_msg) {
+	try {
+		if (!parent_lot_name) {
+			if (err_msg) {
+				*err_msg = strdup("parent_lot_name must not be a null pointer.");
+			}
+			return -1;
+		}
+		if (!output) {
+			if (err_msg) {
+				*err_msg = strdup("output must not be a null pointer.");
+			}
+			return -1;
+		}
+
+		auto rp = lotman::Lot::get_available_capacity(parent_lot_name, start_time, end_time);
+		if (!rp.second.empty()) {
+			if (err_msg) {
+				*err_msg = strdup(rp.second.c_str());
+			}
+			return -1;
+		}
+
+		*output = strdup(rp.first.dump().c_str());
+		if (!*output) {
+			if (err_msg) {
+				*err_msg = strdup("Failed to allocate output buffer.");
+			}
+			return -1;
+		}
 		return 0;
 	} catch (std::exception &exc) {
 		if (err_msg) {
@@ -1570,10 +1677,11 @@ int lotman_get_lot_as_json(const char *lot_name, const bool recursive, char **ou
 	}
 }
 
-int lotman_get_lots_from_dir(const char *dir, const bool recursive, char ***output, char **err_msg) {
+int lotman_get_lots_from_dir(const char *dir, const bool recursive, int64_t query_time, char ***output,
+							 char **err_msg) {
 	try {
 
-		auto rp = lotman::Lot::get_lots_from_dir(dir, recursive);
+		auto rp = lotman::Lot::get_lots_from_dir(dir, recursive, query_time);
 		if (!rp.second.empty()) { // There was an error
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1622,6 +1730,36 @@ int lotman_set_context_str(const char *key, const char *value, char **err_msg) {
 			lotman::Context::set_caller(value);
 		} else if (strcmp(key, "lot_home") == 0) {
 			lotman::Context::set_lot_home(value);
+		} else if (strcmp(key, "strict_hierarchy") == 0) {
+			if (strcmp(value, "true") == 0 || strcmp(value, "1") == 0) {
+				lotman::Context::set_strict_hierarchy(true);
+			} else if (strcmp(value, "false") == 0 || strcmp(value, "0") == 0) {
+				lotman::Context::set_strict_hierarchy(false);
+			} else {
+				if (err_msg) {
+					*err_msg = strdup("Value for strict_hierarchy must be 'true', 'false', '1', or '0'.");
+				}
+				return -1;
+			}
+		} else if (strcmp(key, "contraction_policy") == 0) {
+			auto rv = lotman::Context::set_contraction_policy(value);
+			if (!rv.first) {
+				if (err_msg) {
+					*err_msg = strdup(rv.second.c_str());
+				}
+				return -1;
+			}
+		} else if (strcmp(key, "admin_override") == 0) {
+			if (strcmp(value, "true") == 0 || strcmp(value, "1") == 0) {
+				lotman::Context::set_admin_override(true);
+			} else if (strcmp(value, "false") == 0 || strcmp(value, "0") == 0) {
+				lotman::Context::set_admin_override(false);
+			} else {
+				if (err_msg) {
+					*err_msg = strdup("Value for admin_override must be 'true', 'false', '1', or '0'.");
+				}
+				return -1;
+			}
 		}
 
 		else {
@@ -1653,6 +1791,12 @@ int lotman_get_context_str(const char *key, char **output, char **err_msg) {
 			*output = strdup(lotman::Context::get_caller().c_str());
 		} else if (strcmp(key, "lot_home") == 0) {
 			*output = strdup(lotman::Context::get_lot_home().c_str());
+		} else if (strcmp(key, "strict_hierarchy") == 0) {
+			*output = strdup(lotman::Context::get_strict_hierarchy() ? "true" : "false");
+		} else if (strcmp(key, "contraction_policy") == 0) {
+			*output = strdup(lotman::Context::get_contraction_policy().c_str());
+		} else if (strcmp(key, "admin_override") == 0) {
+			*output = strdup(lotman::Context::get_admin_override() ? "true" : "false");
 		} else {
 			if (err_msg) {
 				std::string err = "Unrecognized key: " + static_cast<std::string>(key);

@@ -118,6 +118,18 @@ struct SchemaVersion {
 };
 
 /**
+ * Tracks how a child lot's MPA values are attributed across its parents.
+ * Each row describes a (child, parent, MPA_key) triple and the fraction
+ * of the child's MPA that is counted against that parent.
+ */
+struct ParentChildAttribution {
+	std::string child_lot_name;
+	std::string parent_lot_name;
+	std::string mpa_key; // e.g. "dedicated_GB", "opportunistic_GB", "max_num_objects"
+	double fraction;	 // 0.0 to 1.0, how much of child's MPA is attributed to this parent
+};
+
+/**
  * Creates the sqlite_orm storage definition.
  * This defines the schema mapping between C++ structs and SQLite tables.
  */
@@ -132,9 +144,9 @@ inline auto create_storage(const std::string &db_path) {
 				   make_column("owner", &Owner::owner)),
 		make_table("parents", make_column("lot_name", &Parent::lot_name), make_column("parent", &Parent::parent),
 				   primary_key(&Parent::lot_name, &Parent::parent)),
-		make_table("paths", make_column("lot_name", &Path::lot_name), make_column("path", &Path::path, unique()),
-				   make_column("recursive", &Path::recursive),
-				   make_column("exclude", &Path::exclude, default_value(0))),
+		make_table("paths", make_column("lot_name", &Path::lot_name), make_column("path", &Path::path),
+				   make_column("recursive", &Path::recursive), make_column("exclude", &Path::exclude, default_value(0)),
+				   primary_key(&Path::lot_name, &Path::path)),
 		make_table("management_policy_attributes",
 				   make_column("lot_name", &ManagementPolicyAttributes::lot_name, primary_key()),
 				   make_column("dedicated_GB", &ManagementPolicyAttributes::dedicated_GB),
@@ -150,7 +162,13 @@ inline auto create_storage(const std::string &db_path) {
 				   make_column("self_GB_being_written", &LotUsage::self_GB_being_written),
 				   make_column("children_GB_being_written", &LotUsage::children_GB_being_written),
 				   make_column("self_objects_being_written", &LotUsage::self_objects_being_written),
-				   make_column("children_objects_being_written", &LotUsage::children_objects_being_written)));
+				   make_column("children_objects_being_written", &LotUsage::children_objects_being_written)),
+		make_table("parent_child_attributions", make_column("child_lot_name", &ParentChildAttribution::child_lot_name),
+				   make_column("parent_lot_name", &ParentChildAttribution::parent_lot_name),
+				   make_column("mpa_key", &ParentChildAttribution::mpa_key),
+				   make_column("fraction", &ParentChildAttribution::fraction),
+				   primary_key(&ParentChildAttribution::child_lot_name, &ParentChildAttribution::parent_lot_name,
+							   &ParentChildAttribution::mpa_key)));
 }
 
 // Type alias for the storage type

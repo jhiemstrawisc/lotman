@@ -81,19 +81,18 @@ void migrate_db(Storage &storage, int current_version, int target_version) {
 				// 2. The 'exclude' column is added to the paths table by sync_schema().
 				//    This supports path exclusions where a lot can track /foo recursively
 				//    but exclude /foo/bar from that tracking.
+				// 3. The paths table uses a composite primary key (lot_name, path) instead
+				//    of unique(path), allowing different lots to share paths with
+				//    non-overlapping time ranges.
+				// 4. The parent_child_attributions table is created by sync_schema().
 				//
 				// v0 databases are those created before the schema_versions table existed.
 				// They may have paths stored without trailing slashes.
 				//
-				// Note: This iterates through paths and issues individual UPDATE statements.
-				// While a single raw SQL UPDATE would be more efficient, this approach:
-				// 1. Uses the ORM consistently with the rest of the codebase
-				// 2. Only runs once per database (on upgrade from v0)
-				// 3. The paths table is typically small enough that this is acceptable
-				//
-				// Note: The 'exclude' column is added automatically by sync_schema() which
-				// is called before migrations. New columns with default values are handled
-				// safely by SQLite's ALTER TABLE ADD COLUMN.
+				// Note: The constraint change on paths (unique→composite PK) requires
+				// recreating the table. Since this version is unreleased, sync_schema()
+				// handles this. For pre-existing test databases, a manual DB reset may
+				// be needed.
 				using namespace sqlite_orm;
 
 				// Normalize paths with trailing slashes
@@ -825,50 +824,57 @@ std::pair<std::vector<std::vector<std::string>>, std::string> SQL_get_matches_mu
 // Implementation of Lot and Checks database methods
 
 std::pair<bool, std::string> Lot::write_new() {
+	// Note: caller (store_lot) must wrap this in a transaction.
 	try {
 		auto &storage = db::StorageManager::get_storage();
 
-		// Use a transaction for atomicity
-		storage.transaction([&] {
-			// Use replace() for tables with text primary keys
-			db::Owner owner_record{lot_name, owner};
-			storage.replace(owner_record);
+		db::Owner owner_record{lot_name, owner};
+		storage.replace(owner_record);
 
-			// Insert parents
-			for (const auto &parent : parents) {
-				db::Parent parent_record{lot_name, parent};
-				storage.replace(parent_record);
+		for (const auto &parent : parents) {
+			db::Parent parent_record{lot_name, parent};
+			storage.replace(parent_record);
+		}
+
+		// Temporal overlap check: ensure no other lot claims the same path
+		// during an overlapping time period before inserting paths.
+		for (const auto &path_json : paths) {
+			std::string path_str = path_json.at("path").get<std::string>();
+			std::string normalized = ensure_trailing_slash(path_str);
+			bool exclude = path_json.contains("exclude") ? path_json["exclude"].get<bool>() : false;
+
+			if (!exclude) {
+				auto overlap = check_path_temporal_overlap(lot_name, normalized, man_policy_attr.creation_time,
+														   man_policy_attr.expiration_time);
+				if (!overlap.first) {
+					return overlap;
+				}
 			}
+		}
 
-			// Insert paths
-			for (const auto &path : paths) {
-				storage.replace(db::create_path_record(lot_name, path));
-			}
+		for (const auto &path : paths) {
+			storage.replace(db::create_path_record(lot_name, path));
+		}
 
-			// Insert management policy attributes
-			db::ManagementPolicyAttributes mpa{lot_name,
-											   man_policy_attr.dedicated_GB,
-											   man_policy_attr.opportunistic_GB,
-											   man_policy_attr.max_num_objects,
-											   man_policy_attr.creation_time,
-											   man_policy_attr.expiration_time,
-											   man_policy_attr.deletion_time};
-			storage.replace(mpa);
+		db::ManagementPolicyAttributes mpa{lot_name,
+										   man_policy_attr.dedicated_GB,
+										   man_policy_attr.opportunistic_GB,
+										   man_policy_attr.max_num_objects,
+										   man_policy_attr.creation_time,
+										   man_policy_attr.expiration_time,
+										   man_policy_attr.deletion_time};
+		storage.replace(mpa);
 
-			// Insert initial usage (all zeros)
-			db::LotUsage usage_record{lot_name,
-									  usage.self_GB,
-									  usage.children_GB,
-									  usage.self_objects,
-									  usage.children_objects,
-									  usage.self_GB_being_written,
-									  usage.children_GB_being_written,
-									  usage.self_objects_being_written,
-									  usage.children_objects_being_written};
-			storage.replace(usage_record);
-
-			return true; // Commit transaction
-		});
+		db::LotUsage usage_record{lot_name,
+								  usage.self_GB,
+								  usage.children_GB,
+								  usage.self_objects,
+								  usage.children_objects,
+								  usage.self_GB_being_written,
+								  usage.children_GB_being_written,
+								  usage.self_objects_being_written,
+								  usage.children_objects_being_written};
+		storage.replace(usage_record);
 
 		return std::make_pair(true, "");
 	} catch (const std::exception &e) {
@@ -877,22 +883,26 @@ std::pair<bool, std::string> Lot::write_new() {
 }
 
 std::pair<bool, std::string> Lot::delete_lot_from_db() {
+	// Note: caller (destroy_lot, destroy_lot_recursive) must wrap this in a transaction.
 	try {
 		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
 
-		storage.transaction([&] {
-			using namespace sqlite_orm;
+		// Delete from all tables where lot_name matches
+		storage.remove_all<db::Owner>(where(c(&db::Owner::lot_name) == lot_name));
+		storage.remove_all<db::Parent>(where(c(&db::Parent::lot_name) == lot_name));
+		storage.remove_all<db::Path>(where(c(&db::Path::lot_name) == lot_name));
+		storage.remove_all<db::ManagementPolicyAttributes>(
+			where(c(&db::ManagementPolicyAttributes::lot_name) == lot_name));
+		storage.remove_all<db::LotUsage>(where(c(&db::LotUsage::lot_name) == lot_name));
 
-			// Delete from all tables where lot_name matches
-			storage.remove_all<db::Owner>(where(c(&db::Owner::lot_name) == lot_name));
-			storage.remove_all<db::Parent>(where(c(&db::Parent::lot_name) == lot_name));
-			storage.remove_all<db::Path>(where(c(&db::Path::lot_name) == lot_name));
-			storage.remove_all<db::ManagementPolicyAttributes>(
-				where(c(&db::ManagementPolicyAttributes::lot_name) == lot_name));
-			storage.remove_all<db::LotUsage>(where(c(&db::LotUsage::lot_name) == lot_name));
+		// Remove attributions where this lot is child or parent
+		storage.remove_all<db::ParentChildAttribution>(
+			where(c(&db::ParentChildAttribution::child_lot_name) == lot_name or
+				  c(&db::ParentChildAttribution::parent_lot_name) == lot_name));
 
-			return true; // Commit
-		});
+		// Remove dangling parent references from other lots that had this lot as a parent
+		storage.remove_all<db::Parent>(where(c(&db::Parent::parent) == lot_name));
 
 		return std::make_pair(true, "");
 	} catch (const std::exception &e) {
@@ -970,36 +980,45 @@ std::pair<bool, std::string> Lot::store_updates(const std::string &update_stmt,
 	}
 }
 
-std::pair<bool, std::string> Lot::store_new_paths(const std::vector<nlohmann::json> &new_paths) {
-	try {
-		auto &storage = db::StorageManager::get_storage();
+std::pair<bool, std::string> Lot::check_path_temporal_overlap(const std::string &lot_name,
+															  const std::string &normalized_path, int64_t creation_time,
+															  int64_t expiration_time) {
+	// Single JOIN query replaces the previous N+1 pattern (one SELECT for
+	// candidate lots, plus one get_pointer per candidate).
+	std::string query = "SELECT p.lot_name, mpa.creation_time, mpa.expiration_time "
+						"FROM paths p "
+						"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
+						"WHERE p.path = ?1 AND p.lot_name != ?2 AND p.exclude = 0 "
+						"AND ?3 < mpa.expiration_time AND mpa.creation_time < ?4 "
+						"LIMIT 1;";
+	std::map<std::string, std::vector<int>> str_map{{normalized_path, {1}}, {lot_name, {2}}};
+	std::map<int64_t, std::vector<int>> int_map{{creation_time, {3}}, {expiration_time, {4}}};
+	auto rp = db::SQL_get_matches_multi_col(query, 3, str_map, int_map);
 
-		// Use transaction for batch insert atomicity
-		storage.transaction([&] {
-			for (const auto &path : new_paths) {
-				storage.replace(db::create_path_record(lot_name, path));
-			}
-			return true; // Commit
-		});
-
-		return std::make_pair(true, "");
-	} catch (const std::exception &e) {
-		return std::make_pair(false, std::string("Failed to store new paths: ") + e.what());
+	if (!rp.second.empty()) {
+		return std::make_pair(false, "Temporal overlap check failed: " + rp.second);
 	}
+
+	if (!rp.first.empty()) {
+		const auto &row = rp.first[0];
+		return std::make_pair(false, "Path '" + normalized_path + "' has a temporal overlap with lot '" + row[0] +
+										 "'. Time ranges (treated as half-open intervals [start, end)) overlap: [" +
+										 std::to_string(creation_time) + ", " + std::to_string(expiration_time) +
+										 ") vs [" + row[1] + ", " + row[2] + ").");
+	}
+
+	return std::make_pair(true, "");
 }
 
 std::pair<bool, std::string> Lot::store_new_parents(const std::vector<Lot> &new_parents) {
+	// Note: caller (add_parents) must wrap this in a transaction.
 	try {
 		auto &storage = db::StorageManager::get_storage();
 
-		// Use transaction for batch insert atomicity
-		storage.transaction([&] {
-			for (const auto &parent : new_parents) {
-				db::Parent parent_record{lot_name, parent.lot_name};
-				storage.replace(parent_record);
-			}
-			return true; // Commit
-		});
+		for (const auto &parent : new_parents) {
+			db::Parent parent_record{lot_name, parent.lot_name};
+			storage.replace(parent_record);
+		}
 
 		return std::make_pair(true, "");
 	} catch (const std::exception &e) {
@@ -1008,18 +1027,15 @@ std::pair<bool, std::string> Lot::store_new_parents(const std::vector<Lot> &new_
 }
 
 std::pair<bool, std::string> Lot::remove_parents_from_db(const std::vector<std::string> &parents) {
+	// Note: caller (remove_parents) must wrap this in a transaction.
 	try {
 		auto &storage = db::StorageManager::get_storage();
 		using namespace sqlite_orm;
 
-		// Use transaction for batch delete atomicity
-		storage.transaction([&] {
-			for (const auto &parent : parents) {
-				storage.remove_all<db::Parent>(
-					where(c(&db::Parent::lot_name) == lot_name and c(&db::Parent::parent) == parent));
-			}
-			return true; // Commit
-		});
+		for (const auto &parent : parents) {
+			storage.remove_all<db::Parent>(
+				where(c(&db::Parent::lot_name) == lot_name and c(&db::Parent::parent) == parent));
+		}
 
 		return std::make_pair(true, "");
 	} catch (const std::exception &e) {
@@ -1037,8 +1053,9 @@ std::pair<bool, std::string> Lot::remove_paths_from_db(const std::vector<std::st
 			for (const auto &path : paths) {
 				// Normalize path with trailing slash to match stored format
 				std::string normalized_path = ensure_trailing_slash(path);
-				// Paths are unique, so we don't need lot_name in the condition
-				storage.remove_all<db::Path>(where(c(&db::Path::path) == normalized_path));
+				// Paths are keyed by composite (lot_name, path)
+				storage.remove_all<db::Path>(
+					where(c(&db::Path::lot_name) == lot_name and c(&db::Path::path) == normalized_path));
 			}
 			return true; // Commit
 		});

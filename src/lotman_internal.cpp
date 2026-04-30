@@ -2,12 +2,133 @@
 
 #include "lotman_db.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <functional>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <sys/stat.h>
 
 using json = nlohmann::json;
 using namespace lotman;
+
+namespace {
+
+// Sweep-line event representing a change in concurrent resource usage at a point in time.
+struct SweepEvent {
+	int64_t time;
+	double delta_ded;
+	double delta_opp;
+	double delta_obj;
+	bool is_start; // true=addition, false=removal (used for tie-breaking)
+};
+
+// Peak concurrent resource usage found by the sweep-line.
+struct SweepResult {
+	double peak_ded = 0.0;
+	double peak_opp = 0.0;
+	double peak_obj = 0.0;
+	double peak_total = 0.0; // peak of (ded + opp) at a single point in time
+};
+
+// Sort events and sweep to find peak concurrent usage.
+// Events are sorted by time, with removals before additions at the same time.
+SweepResult run_sweep_line(std::vector<SweepEvent> &events) {
+	std::sort(events.begin(), events.end(), [](const SweepEvent &a, const SweepEvent &b) {
+		if (a.time != b.time)
+			return a.time < b.time;
+		return a.is_start < b.is_start; // false (removal) < true (addition)
+	});
+
+	double cur_ded = 0.0, cur_opp = 0.0, cur_obj = 0.0;
+	SweepResult result;
+
+	for (const auto &ev : events) {
+		cur_ded += ev.delta_ded;
+		cur_opp += ev.delta_opp;
+		cur_obj += ev.delta_obj;
+
+		if (cur_ded > result.peak_ded)
+			result.peak_ded = cur_ded;
+		if (cur_opp > result.peak_opp)
+			result.peak_opp = cur_opp;
+		if (cur_obj > result.peak_obj)
+			result.peak_obj = cur_obj;
+
+		double cur_total = cur_ded + cur_opp;
+		if (cur_total > result.peak_total)
+			result.peak_total = cur_total;
+	}
+	return result;
+}
+
+// Helper to build sweep events from a parent's children's attributions.
+// If time window is specified (start_time < end_time), events are clipped to [start_time, end_time).
+// Returns events vector (may be empty if no children or none overlap window).
+std::vector<SweepEvent> build_attribution_events(const std::string &parent_lot_name, int64_t start_time = 0,
+												 int64_t end_time = 0) {
+	auto &storage = db::StorageManager::get_storage();
+	using namespace sqlite_orm;
+
+	std::vector<SweepEvent> events;
+	bool has_window = (start_time < end_time);
+
+	// Get all children of this parent (non-self)
+	auto child_names = storage.select(&db::Parent::lot_name, where(c(&db::Parent::parent) == parent_lot_name and
+																   c(&db::Parent::lot_name) != parent_lot_name));
+
+	for (const auto &child_name : child_names) {
+		auto child_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(child_name);
+		if (!child_mpa)
+			continue;
+
+		// If window specified, skip children that don't overlap it
+		if (has_window && (child_mpa->creation_time >= end_time || child_mpa->expiration_time <= start_time))
+			continue;
+
+		// Get attributions from this parent to this child
+		auto attrs = storage.get_all<db::ParentChildAttribution>(
+			where(c(&db::ParentChildAttribution::parent_lot_name) == parent_lot_name and
+				  c(&db::ParentChildAttribution::child_lot_name) == child_name));
+
+		// Compute attributed fractions
+		std::map<std::string, double> fractions;
+		for (const auto &attr : attrs) {
+			fractions[attr.mpa_key] = attr.fraction;
+		}
+
+		// Fail fast if attribution rows are missing for an active child-parent edge
+		// when strict hierarchy is enabled
+		if (attrs.empty() && lotman::Context::get_strict_hierarchy()) {
+			throw std::runtime_error("Missing attribution rows for child '" + child_name + "' under parent '" +
+									 parent_lot_name + "'");
+		}
+
+		double attr_ded =
+			fractions.count("dedicated_GB") ? fractions.at("dedicated_GB") * child_mpa->dedicated_GB : 0.0;
+		double attr_opp =
+			fractions.count("opportunistic_GB") ? fractions.at("opportunistic_GB") * child_mpa->opportunistic_GB : 0.0;
+		double attr_obj = fractions.count("max_num_objects")
+							  ? std::round(fractions.at("max_num_objects") * child_mpa->max_num_objects)
+							  : 0.0;
+
+		// Determine event times: use child's full interval or clip to window
+		int64_t event_start = child_mpa->creation_time;
+		int64_t event_end = child_mpa->expiration_time;
+		if (has_window) {
+			event_start = std::max(event_start, start_time);
+			event_end = std::min(event_end, end_time);
+		}
+
+		events.push_back({event_start, attr_ded, attr_opp, attr_obj, true});
+		events.push_back({event_end, -attr_ded, -attr_opp, -attr_obj, false});
+	}
+
+	return events;
+}
+
+} // anonymous namespace
 
 // TODO: Go through and make things const where they should be declared as such
 // TODO: Optimize functions that instantiate a whole lot, when that isn't really needed
@@ -33,6 +154,12 @@ std::pair<bool, std::string> lotman::Lot::init_full(json lot_JSON) {
 	man_policy_attr.creation_time = lot_JSON["management_policy_attrs"]["creation_time"];
 	man_policy_attr.expiration_time = lot_JSON["management_policy_attrs"]["expiration_time"];
 	man_policy_attr.deletion_time = lot_JSON["management_policy_attrs"]["deletion_time"];
+
+	// Half-open interval [creation_time, expiration_time) must be non-empty
+	if (man_policy_attr.creation_time >= man_policy_attr.expiration_time) {
+		return std::make_pair(false, "creation_time must be strictly less than expiration_time (half-open interval "
+									 "[creation, expiration) must be non-empty)");
+	}
 
 	usage.self_GB = 0;
 	usage.children_GB = 0;
@@ -74,7 +201,7 @@ void lotman::Lot::init_self_usage() {
 	usage.children_objects_being_written = 0;
 }
 
-std::pair<bool, std::string> lotman::Lot::store_lot() {
+std::pair<bool, std::string> lotman::Lot::store_lot(const json &parent_attributions_json) {
 	if (!full_lot) {
 		return std::make_pair(false, "Lot was not fully initialized");
 	}
@@ -111,35 +238,60 @@ std::pair<bool, std::string> lotman::Lot::store_lot() {
 		}
 	}
 
-	// Store the lot, begin updating other lots after confirming the lot has been successfully stored
-	auto rp = this->write_new();
-	if (!rp.first) {
-		std::string int_err = rp.second;
-		std::string ext_err = "Failure to store new lot: ";
-		return std::make_pair(false, ext_err + int_err);
-	}
+	// Store lot, compute attributions, and validate in a single transaction.
+	// If any step fails, all DB changes are rolled back atomically.
+	{
+		auto &storage = db::StorageManager::get_storage();
+		std::string txn_error;
+		bool committed = storage.transaction([&] {
+			auto rp_inner = this->write_new();
+			if (!rp_inner.first) {
+				txn_error = "Failure to store new lot: " + rp_inner.second;
+				return false;
+			}
 
-	bool parent_updated = true;
-	for (auto &parents_iter : parents) {
-		for (auto &children_iter : children) {
-			if (lotman::Checks::insertion_check(lot_name, parents_iter, children_iter)) {
-				// Update child to have lot_name as a parent instead of parents_iter. Later, save LTBA with all its
-				// specified parents.
-				Lot child(children_iter);
+			if (lot_name != "default") {
+				rp_inner = compute_and_store_attributions(parent_attributions_json);
+				if (!rp_inner.first) {
+					txn_error = "Failed to compute attributions: " + rp_inner.second;
+					return false;
+				}
 
-				json update_arr = json::array();
-				update_arr.push_back({{"current", parents_iter}, {"new", lot_name}});
-
-				rp = child.update_parents(update_arr);
-				parent_updated = rp.first;
-				if (!parent_updated) {
-					std::string int_err = rp.second;
-					std::string ext_err = "Failure on call to child.update_parents: ";
-					return std::make_pair(false, ext_err + int_err);
+				auto vr = apply_validation_predicates(build_axiom_predicates(lot_name));
+				if (!vr.first) {
+					txn_error = vr.second;
+					return false;
 				}
 			}
+
+			// Insertion adjustment: if the new lot is being inserted between
+			// existing parent-child relationships, update children's parent pointers.
+			for (auto &parents_iter : parents) {
+				for (auto &children_iter : children) {
+					if (lotman::Checks::insertion_check(lot_name, parents_iter, children_iter)) {
+						Lot child(children_iter);
+						json update_arr = json::array();
+						update_arr.push_back({{"current", parents_iter}, {"new", lot_name}});
+						if (!child.update_parents_impl(update_arr, txn_error)) {
+							return false;
+						}
+						if (child.lot_name != "default") {
+							if (!child.reload_and_recompute_attributions(txn_error)) {
+								return false;
+							}
+						}
+					}
+				}
+			}
+
+			return true;
+		});
+
+		if (!committed) {
+			return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
 		}
 	}
+
 	return std::make_pair(true, "");
 }
 
@@ -197,6 +349,14 @@ std::pair<bool, std::string> lotman::Lot::destroy_lot() {
 		return std::make_pair(false, "The default lot cannot be deleted.");
 	}
 
+	// Contraction policy: deletion = contraction to zero
+	{
+		auto cp = check_contraction_for_deletion(lot_name);
+		if (!cp.first) {
+			return cp;
+		}
+	}
+
 	// Prechecks complete, get the children for LTBR
 	auto rp_lotvec_str = this->get_children();
 	if (!rp_lotvec_str.second.empty()) { // There is an error message
@@ -205,81 +365,77 @@ std::pair<bool, std::string> lotman::Lot::destroy_lot() {
 		return std::make_pair(false, ext_err + int_err);
 	}
 
-	// std::vector<Lot> children = rp_lotvec_str.first;
-	//  If there are no children, the lot can be deleted without issue
-	if (self_children.empty()) {
-		auto rp_bool_str = this->delete_lot_from_db();
-		if (!rp_bool_str.first) {
-			std::string int_err = rp_bool_str.second;
-			std::string ext_err = "Failed to delete the lot from the database: ";
-			return std::make_pair(false, ext_err + int_err);
-		}
-		return std::make_pair(true, "");
-	}
-
-	// Reaching this point means there are children --> Reassign them
-
+	// --- Read-only phase: determine which children need reparenting ---
+	std::vector<Lot *> children_to_reparent;
 	for (auto &child : self_children) {
-		if (lotman::Checks::will_be_orphaned(lot_name,
-											 child.lot_name)) { // Indicates whether LTBR is the only parent to child
-			if (reassignment_policy.assign_LTBR_parent_as_parent_to_orphans) {
-				auto rp_bool_str = this->check_if_root();
-				if (!rp_bool_str.second.empty()) {
-					std::string int_err = rp_bool_str.second;
-					std::string ext_err = "Function call to lotman::Lot::check_if_root failed: ";
-					return std::make_pair(false, ext_err + int_err);
-				}
-				if (is_root) {
-					return std::make_pair(
-						false, "The lot being removed is a root, and has no parents to assign to its children.");
-				}
-
-				// Since lots have only one explicit owner, we cannot reassign ownership.
-
-				// Generate parents of current lot for assignment to children -- only need immediate parents
-				this->get_parents();
-				// Now assign parents of LTBR to orphan children of LTBR
-				// No need to perform cycle check in this case
-				rp_bool_str = child.add_parents(self_parents);
-				if (!rp_bool_str.first) {
-					std::string int_err = rp_bool_str.second;
-					std::string ext_err = "Failure on call to lotman::Lot::add_parents for child lot: ";
-					return std::make_pair(false, ext_err + int_err);
-				}
-			} else {
-				return std::make_pair(false, "The operation cannot be completed as requested because deleting the lot "
-											 "would create an orphan that requires explicit assignment to the default "
-											 "lot. Set assign_LTBR_parent_as_parent_to_orphans=true.");
-			}
+		bool orphaned = lotman::Checks::will_be_orphaned(lot_name, child.lot_name);
+		if (orphaned && !reassignment_policy.assign_LTBR_parent_as_parent_to_orphans) {
+			return std::make_pair(false, "The operation cannot be completed as requested because deleting the lot "
+										 "would create an orphan that requires explicit assignment to the default "
+										 "lot. Set assign_LTBR_parent_as_parent_to_orphans=true.");
 		}
-		if (reassignment_policy.assign_LTBR_parent_as_parent_to_non_orphans) {
-			auto rp_bool_str = this->check_if_root();
-			if (!rp_bool_str.second.empty()) {
-				std::string int_err = rp_bool_str.second;
-				std::string ext_err = "Function call to lotman::Lot::check_if_root failed: ";
-				return std::make_pair(false, ext_err + int_err);
-			}
-			if (is_root) {
-				return std::make_pair(false,
-									  "The lot being removed is a root, and has no parents to assign to its children.");
-			}
-			this->get_parents();
-			// Now assign parents of LTBR to non-orphan children of LTBR
-			// No need to perform cycle check in this case
-			rp_bool_str = child.add_parents(self_parents);
-			if (!rp_bool_str.first) {
-				std::string int_err = rp_bool_str.second;
-				std::string ext_err = "Function call to lotman::Lot::add_parents for child lot failed: ";
-				return std::make_pair(false, ext_err + int_err);
-			}
+		if ((orphaned && reassignment_policy.assign_LTBR_parent_as_parent_to_orphans) ||
+			reassignment_policy.assign_LTBR_parent_as_parent_to_non_orphans) {
+			children_to_reparent.push_back(&child);
 		}
 	}
-	auto rp_bool_str = delete_lot_from_db();
-	if (!rp_bool_str.first) {
-		std::string int_err = rp_bool_str.second;
-		std::string ext_err = "Function call to lotman::Lot::delete_lot_from_db failed: ";
-		return std::make_pair(false, ext_err + int_err);
+
+	if (!children_to_reparent.empty()) {
+		auto rp_bool_str = this->check_if_root();
+		if (!rp_bool_str.second.empty()) {
+			return std::make_pair(false, "Function call to lotman::Lot::check_if_root failed: " + rp_bool_str.second);
+		}
+		if (is_root) {
+			return std::make_pair(false,
+								  "The lot being removed is a root, and has no parents to assign to its children.");
+		}
+		this->get_parents();
 	}
+
+	// --- Write phase: reparent children + delete LTBR in a single transaction ---
+	{
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+		std::string txn_error;
+		bool committed = storage.transaction([&] {
+			// Step 1: Add LTBR's parents to children that need reparenting
+			for (auto *child : children_to_reparent) {
+				auto rp = child->store_new_parents(self_parents);
+				if (!rp.first) {
+					txn_error = "Failed to add parents to child lot '" + child->lot_name + "': " + rp.second;
+					return false;
+				}
+			}
+
+			// Step 2: Delete LTBR (also cleans up reverse parent refs + attributions involving LTBR)
+			auto drp = delete_lot_from_db();
+			if (!drp.first) {
+				txn_error = "Failed to delete lot: " + drp.second;
+				return false;
+			}
+
+			// Step 3: Recompute attributions for ALL children that had LTBR as a parent.
+			// Reparented children had LTBR replaced by LTBR's parents; non-reparented
+			// children simply lost LTBR as a parent. In both cases the attribution
+			// rows referencing LTBR were deleted in Step 2, so the remaining
+			// attributions no longer sum correctly. Reload from DB and recompute.
+			for (auto &child : self_children) {
+				if (child.lot_name == "default")
+					continue;
+
+				if (!child.reload_and_recompute_attributions(txn_error)) {
+					return false;
+				}
+			}
+
+			return true;
+		});
+
+		if (!committed) {
+			return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
+		}
+	}
+
 	return std::make_pair(true, "");
 }
 
@@ -287,6 +443,14 @@ std::pair<bool, std::string> lotman::Lot::destroy_lot_recursive() {
 
 	if (lot_name == "default") {
 		return std::make_pair(false, "The default lot cannot be deleted.");
+	}
+
+	// Contraction policy: deletion = contraction to zero
+	{
+		auto cp = check_contraction_for_deletion(lot_name);
+		if (!cp.first) {
+			return cp;
+		}
 	}
 
 	// Prechecks complete, get the children for LTBR
@@ -297,15 +461,39 @@ std::pair<bool, std::string> lotman::Lot::destroy_lot_recursive() {
 		return std::make_pair(false, ext_err + int_err);
 	}
 
-	for (auto &child : recursive_children) {
-		auto rp_bool_str = child.delete_lot_from_db();
-		if (!rp_bool_str.first) {
-			std::string int_err = rp_bool_str.second;
-			std::string ext_err = "Failed to delete a lot from the database: ";
-			return std::make_pair(false, ext_err + int_err);
+	// Contraction policy must also be checked for every child in the subtree
+	for (const auto &child : recursive_children) {
+		auto cp = check_contraction_for_deletion(child.lot_name);
+		if (!cp.first) {
+			return cp;
 		}
 	}
-	this->delete_lot_from_db();
+
+	// Delete all children and self in a single atomic transaction.
+	{
+		auto &storage = db::StorageManager::get_storage();
+		std::string txn_error;
+		bool committed = storage.transaction([&] {
+			for (auto &child : recursive_children) {
+				auto rp_bool_str = child.delete_lot_from_db();
+				if (!rp_bool_str.first) {
+					txn_error = "Failed to delete child lot '" + child.lot_name + "': " + rp_bool_str.second;
+					return false;
+				}
+			}
+			auto rp_bool_str = this->delete_lot_from_db();
+			if (!rp_bool_str.first) {
+				txn_error = "Failed to delete lot '" + lot_name + "': " + rp_bool_str.second;
+				return false;
+			}
+			return true;
+		});
+
+		if (!committed) {
+			return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
+		}
+	}
+
 	return std::make_pair(true, "");
 }
 
@@ -592,19 +780,26 @@ std::pair<json, std::string> lotman::Lot::get_lot_dirs(const bool recursive) {
 	}
 }
 
-std::pair<std::string, std::string> lotman::Lot::get_lot_from_dir(const std::string &dir_path) {
+std::pair<std::string, std::string> lotman::Lot::get_lot_from_dir(const std::string &dir_path, int64_t query_time) {
 	try {
-		auto &storage = db::StorageManager::get_storage();
-		using namespace sqlite_orm;
-
 		// Normalize path with trailing slash to match stored format
 		std::string normalized_path = ensure_trailing_slash(dir_path);
-		auto lot_names = storage.select(&db::Path::lot_name, where(c(&db::Path::path) == normalized_path));
 
-		if (lot_names.empty()) {
-			return std::make_pair("", ""); // Nothing existed, and no error. Return empty strings!
+		std::string query = "SELECT p.lot_name FROM paths p "
+							"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
+							"WHERE p.path = ?1 AND mpa.creation_time <= ?2 AND mpa.expiration_time > ?2 "
+							"LIMIT 1;";
+		std::map<std::string, std::vector<int>> str_map{{normalized_path, {1}}};
+		std::map<int64_t, std::vector<int>> int_map{{query_time, {2}}};
+		auto rp = db::SQL_get_matches(query, str_map, int_map);
+
+		if (!rp.second.empty()) {
+			return std::make_pair("", std::string("get_lot_from_dir query failed: ") + rp.second);
 		}
-		return std::make_pair(lot_names[0], "");
+		if (rp.first.empty()) {
+			return std::make_pair("", "");
+		}
+		return std::make_pair(rp.first[0], "");
 	} catch (const std::exception &e) {
 		return std::make_pair("", std::string("get_lot_from_dir failed: ") + e.what());
 	}
@@ -927,7 +1122,87 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 	return std::make_pair(output_obj, "");
 }
 
+// Non-transactional helper: reloads parents and MPAs from DB, clears old attributions,
+// recomputes with equal split, and validates axioms. Caller MUST hold an active transaction.
+bool lotman::Lot::reload_and_recompute_attributions(std::string &txn_error) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		// Reload parents from DB
+		auto parent_records = storage.select(&db::Parent::parent, where(c(&db::Parent::lot_name) == lot_name));
+		parents.clear();
+		for (const auto &p : parent_records) {
+			parents.push_back(p);
+		}
+
+		// Reload MPAs
+		auto mpa_ptr = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+		if (!mpa_ptr) {
+			txn_error = "Lot '" + lot_name + "' not found in management_policy_attributes";
+			return false;
+		}
+		man_policy_attr.dedicated_GB = mpa_ptr->dedicated_GB;
+		man_policy_attr.opportunistic_GB = mpa_ptr->opportunistic_GB;
+		man_policy_attr.max_num_objects = mpa_ptr->max_num_objects;
+
+		// Clear old attributions and recompute with equal split
+		storage.remove_all<db::ParentChildAttribution>(
+			where(c(&db::ParentChildAttribution::child_lot_name) == lot_name));
+		auto attr_rp = compute_and_store_attributions();
+		if (!attr_rp.first) {
+			txn_error = "Failed to recompute attributions for '" + lot_name + "': " + attr_rp.second;
+			return false;
+		}
+
+		auto vr = apply_validation_predicates(build_axiom_predicates(lot_name));
+		if (!vr.first) {
+			txn_error = "Hierarchy violation for '" + lot_name + "': " + vr.second;
+			return false;
+		}
+
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to reload and recompute attributions: ") + e.what();
+		return false;
+	}
+}
+
+// Non-transactional helper: stores parents, reloads state, recomputes attributions, validates.
+// Caller MUST hold an active storage.transaction().
+bool lotman::Lot::add_parents_impl(const std::vector<Lot> &parents, std::string &txn_error) {
+	try {
+		auto rp = store_new_parents(parents);
+		if (!rp.first) {
+			txn_error = "Call to lotman::Lot::store_new_parents failed: " + rp.second;
+			return false;
+		}
+
+		if (lot_name != "default") {
+			if (!reload_and_recompute_attributions(txn_error)) {
+				return false;
+			}
+		}
+
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to add parents: ") + e.what();
+		return false;
+	}
+}
+
 std::pair<bool, std::string> lotman::Lot::add_parents(const std::vector<Lot> &parents) {
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool committed = storage.transaction([&] { return add_parents_in_txn(parents, txn_error); });
+
+	if (!committed) {
+		return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
+	}
+	return std::make_pair(true, "");
+}
+
+bool lotman::Lot::add_parents_in_txn(const std::vector<Lot> &parents, std::string &txn_error) {
 	// Perform a cycle check
 	// Build the list of all proposed parents
 	std::vector<std::string> parent_names;
@@ -948,28 +1223,57 @@ std::pair<bool, std::string> lotman::Lot::add_parents(const std::vector<Lot> &pa
 
 	// Perform the cycle check
 	if (Checks::cycle_check(lot_name, parent_names, children_names)) {
-		std::string err = "The requested parent addition would introduce a dependency cycle.";
-		return std::make_pair(false, err);
+		txn_error = "The requested parent addition would introduce a dependency cycle.";
+		return false;
 	}
 
-	// We've passed the cycle check, store the parents
-	auto rp = store_new_parents(parents);
-	if (!rp.first) {
-		std::string int_err = rp.second;
-		std::string ext_err = "Call to lotman::Lot::store_new_parents failed: ";
-		return std::make_pair(false, ext_err + int_err);
+	return add_parents_impl(parents, txn_error);
+}
+
+std::pair<bool, std::string> lotman::Lot::add_paths(const std::vector<json> &paths) {
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool committed = storage.transaction([&] { return add_paths_in_txn(paths, txn_error); });
+	if (!committed) {
+		return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
 	}
 	return std::make_pair(true, "");
 }
 
-std::pair<bool, std::string> lotman::Lot::add_paths(const std::vector<json> &paths) {
-	auto rp = store_new_paths(paths);
-	if (!rp.first) {
-		std::string int_err = rp.second;
-		std::string ext_err = "Call to lotman::Lot::store_new_paths failed: ";
-		return std::make_pair(false, ext_err + int_err);
+bool lotman::Lot::add_paths_in_txn(const std::vector<json> &paths, std::string &txn_error) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		auto this_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+		if (this_mpa) {
+			for (const auto &path_json : paths) {
+				std::string path_str = path_json.at("path").get<std::string>();
+				std::string normalized = ensure_trailing_slash(path_str);
+
+				bool exclude = path_json.contains("exclude") ? path_json["exclude"].get<bool>() : false;
+				if (!exclude) {
+					auto overlap = check_path_temporal_overlap(lot_name, normalized, this_mpa->creation_time,
+															   this_mpa->expiration_time);
+					if (!overlap.first) {
+						txn_error = overlap.second;
+						return false;
+					}
+				}
+			}
+		}
+
+		for (const auto &path : paths) {
+			std::string normalized = ensure_trailing_slash(path["path"].get<std::string>());
+			bool recursive = path["recursive"].get<bool>();
+			bool exclude = path.contains("exclude") ? path["exclude"].get<bool>() : false;
+			storage.replace(db::Path{lot_name, normalized, static_cast<int>(recursive), static_cast<int>(exclude)});
+		}
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to add paths: ") + e.what();
+		return false;
 	}
-	return std::make_pair(true, "");
 }
 
 std::pair<bool, std::string> lotman::Lot::remove_parents(const std::vector<std::string> &parents_to_remove) {
@@ -1000,13 +1304,32 @@ std::pair<bool, std::string> lotman::Lot::remove_parents(const std::vector<std::
 		return std::make_pair(false, "Could not remove parents because doing so would orphan the lot.");
 	}
 
-	auto rp = remove_parents_from_db(parents_copy);
+	// Remove parents, recompute attributions, and validate in a single transaction.
+	// If any step fails, all DB changes are rolled back atomically.
+	{
+		auto &storage = db::StorageManager::get_storage();
+		std::string txn_error;
+		bool committed = storage.transaction([&] {
+			auto rp = remove_parents_from_db(parents_copy);
+			if (!rp.first) {
+				txn_error = "Call to lotman::Lot::remove_parents failed: " + rp.second;
+				return false;
+			}
 
-	if (!rp.first) {
-		std::string int_err = rp.second;
-		std::string ext_err = "Call to lotman::Lot::remove_parents failed: ";
-		return std::make_pair(false, ext_err + int_err);
+			if (lot_name != "default") {
+				if (!reload_and_recompute_attributions(txn_error)) {
+					return false;
+				}
+			}
+
+			return true;
+		});
+
+		if (!committed) {
+			return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
+		}
 	}
+
 	return std::make_pair(true, "");
 }
 
@@ -1021,39 +1344,87 @@ std::pair<bool, std::string> lotman::Lot::remove_paths(const std::vector<std::st
 }
 
 std::pair<bool, std::string> lotman::Lot::update_owner(const std::string &update_val) {
-	std::string owner_update_stmt = "UPDATE owners SET owner=? WHERE lot_name=?;";
-
-	std::map<std::string, std::vector<int>> owner_update_str_map{{lot_name, {2}}, {update_val, {1}}};
-	auto rp = store_updates(owner_update_stmt, owner_update_str_map);
-	if (!rp.first) {
-		std::string int_err = rp.second;
-		std::string ext_err = "Failure on call to lotman::Lot::store_updates when storing owner update: ";
-		return std::make_pair(false, ext_err + int_err);
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool committed = storage.transaction([&] { return update_owner_in_txn(update_val, txn_error); });
+	if (!committed) {
+		return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
 	}
 	return std::make_pair(true, "");
 }
 
+bool lotman::Lot::update_owner_in_txn(const std::string &update_val, std::string &txn_error) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		// Owner has lot_name as primary key, so replace performs an in-place update.
+		storage.replace(db::Owner{lot_name, update_val});
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to update owner: ") + e.what();
+		return false;
+	}
+}
+
+// Non-transactional helper: updates parent records using ORM.
+// Caller MUST hold an active storage.transaction().
+bool lotman::Lot::update_parents_impl(const json &update_arr, std::string &txn_error) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		for (const auto &update_obj : update_arr) {
+			std::string current_parent = update_obj["current"].get<std::string>();
+			std::string new_parent = update_obj["new"].get<std::string>();
+
+			// Remove old parent record and insert the updated one.
+			// Parent table has composite PK (lot_name, parent), so we must
+			// remove + replace rather than update-in-place.
+			storage.remove_all<db::Parent>(
+				where(c(&db::Parent::lot_name) == lot_name and c(&db::Parent::parent) == current_parent));
+			storage.replace(db::Parent{lot_name, new_parent});
+		}
+
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to update parents: ") + e.what();
+		return false;
+	}
+}
+
 std::pair<bool, std::string> lotman::Lot::update_parents(const json &update_arr) {
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool committed = storage.transaction([&] { return update_parents_in_txn(update_arr, txn_error); });
+
+	if (!committed) {
+		return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
+	}
+
+	return std::make_pair(true, "");
+}
+
+bool lotman::Lot::update_parents_in_txn(const json &update_arr, std::string &txn_error) {
 	// First, perform a cycle check on the whole update arr, and fail if any introduce a cycle
 	// Cycle check takes in three arguments -- The start node (in this case, lot_name), and vectors of parents/children
 	// of the start node as strings
 
 	// Get all the existing parents
-	std::vector<std::string> parents;
+	std::vector<std::string> parent_list;
 	this->get_parents(
 		true, true); // get_self is true because either we need get_self to be true for get_parents or get_children.
 
 	for (const auto &parent_lot : recursive_parents) {
-		parents.push_back(parent_lot.lot_name);
+		parent_list.push_back(parent_lot.lot_name);
 	}
 	// for each existing parent, if it's being updated, swap it out with the new parent.
 	for (const auto &update : update_arr) {
-		auto parent_iter = std::find(parents.begin(), parents.end(), update["current"]);
-		if (parent_iter != parents.end()) {
+		auto parent_iter = std::find(parent_list.begin(), parent_list.end(), update["current"]);
+		if (parent_iter != parent_list.end()) {
 			*parent_iter = update["new"];
 		} else {
-			return std::make_pair(false, "One of the current parents, " + update["current"].get<std::string>() +
-											 ", to be updated is not actually a parent.");
+			txn_error = "One of the current parents, " + update["current"].get<std::string>() +
+						", to be updated is not actually a parent.";
+			return false;
 		}
 	}
 
@@ -1063,116 +1434,215 @@ std::pair<bool, std::string> lotman::Lot::update_parents(const json &update_arr)
 		children.push_back(child_lot.lot_name);
 	}
 
-	if (Checks::cycle_check(lot_name, parents, children)) {
-		std::string err = "The requested parent update would introduce a dependency cycle.";
-		return std::make_pair(false, err);
+	if (Checks::cycle_check(lot_name, parent_list, children)) {
+		txn_error = "The requested parent update would introduce a dependency cycle.";
+		return false;
 	}
 
-	std::string parents_update_stmt = "UPDATE parents SET parent=? WHERE lot_name=? AND parent=?";
-	// Need to store modifications per map entry
-	for (const auto &update_obj : update_arr) {
-		std::map<std::string, std::vector<int>> parents_update_str_map;
-		if (update_obj["current"] == lot_name) {
-			parents_update_str_map = {{update_obj["new"], {1}}, {update_obj["current"], {2, 3}}};
-		} else {
-			parents_update_str_map = {{update_obj["new"], {1}}, {lot_name, {2}}, {update_obj["current"], {3}}};
-		}
-		auto rp = store_updates(parents_update_stmt, parents_update_str_map);
-		if (!rp.first) {
-			std::string int_err = rp.second;
-			std::string ext_err = "Failure on call to lotman::Lot::store_updates when storing parents update: ";
-			return std::make_pair(false, ext_err + int_err);
+	if (!update_parents_impl(update_arr, txn_error)) {
+		return false;
+	}
+	if (lot_name != "default") {
+		if (!reload_and_recompute_attributions(txn_error)) {
+			return false;
 		}
 	}
-	return std::make_pair(true, "");
+	return true;
 }
 
 std::pair<bool, std::string> lotman::Lot::update_paths(const json &update_arr) {
-	// incoming update map looks like {"path1" --> {"path" : "path2", "recursive" : false, "exclude": false}}
-	std::string paths_update_stmt = "UPDATE paths SET path=? WHERE lot_name=? and path=?;";
-	std::string recursive_update_stmt = "UPDATE paths SET recursive=? WHERE lot_name=? and path=?;";
-	std::string exclude_update_stmt = "UPDATE paths SET exclude=? WHERE lot_name=? and path=?;";
-
-	// Iterate through updates, first perform recursive update, then exclude update, THEN path
-	for (const auto &update_obj : update_arr /*update_map*/) {
-		// Normalize paths with trailing slash
-		std::string current_path = ensure_trailing_slash(update_obj["current"].get<std::string>());
-		std::string new_path = ensure_trailing_slash(update_obj["new"].get<std::string>());
-
-		std::map<int64_t, std::vector<int>> recursive_update_int_map{
-			{update_obj["recursive"].get<int>(),
-			 {1}}}; // Unfortunately using int64_t for these bools to write less code
-		std::map<std::string, std::vector<int>> recursive_update_str_map{{lot_name, {2}}, {current_path, {3}}};
-		auto rp = store_updates(recursive_update_stmt, recursive_update_str_map, recursive_update_int_map);
-		if (!rp.first) {
-			std::string int_err = rp.second;
-			std::string ext_err = "Failure on call to lotman::Lot::store_updates when storing paths recursive update: ";
-			return std::make_pair(false, ext_err + int_err);
-		}
-
-		// Exclude update (if provided)
-		if (update_obj.contains("exclude")) {
-			std::map<int64_t, std::vector<int>> exclude_update_int_map{{update_obj["exclude"].get<int>(), {1}}};
-			std::map<std::string, std::vector<int>> exclude_update_str_map{{lot_name, {2}}, {current_path, {3}}};
-			rp = store_updates(exclude_update_stmt, exclude_update_str_map, exclude_update_int_map);
-			if (!rp.first) {
-				std::string int_err = rp.second;
-				std::string ext_err =
-					"Failure on call to lotman::Lot::store_updates when storing paths exclude update: ";
-				return std::make_pair(false, ext_err + int_err);
-			}
-		}
-
-		// Path update
-		std::map<std::string, std::vector<int>> paths_update_str_map{
-			{new_path, {1}}, {lot_name, {2}}, {current_path, {3}}};
-		rp = store_updates(paths_update_stmt, paths_update_str_map);
-		if (!rp.first) {
-			std::string int_err = rp.second;
-			std::string ext_err = "Failure on call to lotman::Lot::store_updates when storing paths path update: ";
-			return std::make_pair(false, ext_err + int_err);
-		}
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool committed = storage.transaction([&] { return update_paths_in_txn(update_arr, txn_error); });
+	if (!committed) {
+		return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
 	}
 	return std::make_pair(true, "");
 }
 
+bool lotman::Lot::update_paths_in_txn(const json &update_arr, std::string &txn_error) {
+	auto &storage = db::StorageManager::get_storage();
+	using namespace sqlite_orm;
+	try {
+		for (const auto &update_obj : update_arr) {
+			std::string current_path = ensure_trailing_slash(update_obj["current"].get<std::string>());
+			std::string new_path = ensure_trailing_slash(update_obj["new"].get<std::string>());
+
+			// Read the current path record
+			auto rows = storage.get_all<db::Path>(
+				where(c(&db::Path::lot_name) == lot_name and c(&db::Path::path) == current_path));
+			if (rows.empty()) {
+				txn_error = "Path not found for update: " + current_path;
+				return false;
+			}
+			auto path_record = rows[0];
+
+			// Apply field updates
+			path_record.recursive = update_obj["recursive"].get<int>();
+			bool exclude_changed_to_false = false;
+			if (update_obj.contains("exclude")) {
+				int new_exclude = update_obj["exclude"].get<int>();
+				if (path_record.exclude && !new_exclude) {
+					exclude_changed_to_false = true;
+				}
+				path_record.exclude = new_exclude;
+			}
+
+			// Check temporal overlap if: (1) path changes, OR (2) exclude flips true→false
+			// In case (2), a previously-excluded path becomes active and might conflict
+			if (current_path != new_path || exclude_changed_to_false) {
+				// Check temporal overlap for the path (if not excluded)
+				if (!path_record.exclude) {
+					auto this_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+					if (this_mpa) {
+						// Use new_path for case (1), current_path for case (2)
+						std::string path_to_check = (current_path != new_path) ? new_path : current_path;
+						auto overlap = check_path_temporal_overlap(lot_name, path_to_check, this_mpa->creation_time,
+																   this_mpa->expiration_time);
+						if (!overlap.first) {
+							txn_error = overlap.second;
+							return false;
+						}
+					}
+				}
+			}
+
+			// If path itself changed, we must remove+replace since path is part of composite PK
+			if (current_path != new_path) {
+				storage.remove_all<db::Path>(
+					where(c(&db::Path::lot_name) == lot_name and c(&db::Path::path) == current_path));
+				path_record.path = new_path;
+			}
+			storage.replace(path_record);
+		}
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to update paths: ") + e.what();
+		return false;
+	}
+}
+
 std::pair<bool, std::string> lotman::Lot::update_man_policy_attrs(const std::string &update_key, double update_val) {
-	std::string man_policy_attr_update_stmt_first_half = "UPDATE management_policy_attributes SET ";
-	std::string man_policy_attr_update_stmt_second_half = "=? WHERE lot_name=?;";
-
-	std::array<std::string, 2> dbl_keys = {"dedicated_GB", "opportunistic_GB"};
-	std::array<std::string, 4> int_keys = {"max_num_objects", "creation_time", "expiration_time", "deletion_time"};
-
-	if (std::find(dbl_keys.begin(), dbl_keys.end(), update_key) != dbl_keys.end()) {
-		std::string man_policy_attr_update_stmt =
-			man_policy_attr_update_stmt_first_half + update_key + man_policy_attr_update_stmt_second_half;
-		std::map<std::string, std::vector<int>> man_policy_attr_update_str_map{{lot_name, {2}}};
-		std::map<double, std::vector<int>> man_policy_attr_update_dbl_map{{update_val, {1}}};
-		auto rp = store_updates(man_policy_attr_update_stmt, man_policy_attr_update_str_map,
-								std::map<int64_t, std::vector<int>>(), man_policy_attr_update_dbl_map);
-		if (!rp.first) {
-			std::string int_err = rp.second;
-			std::string ext_err =
-				"Failure on call to lotman::Lot::store_updates when storing management policy attribute update: ";
-			return std::make_pair(false, ext_err + int_err);
-		}
-	} else if (std::find(int_keys.begin(), int_keys.end(), update_key) != int_keys.end()) {
-		std::string man_policy_attr_update_stmt =
-			man_policy_attr_update_stmt_first_half + update_key + man_policy_attr_update_stmt_second_half;
-		std::map<std::string, std::vector<int>> man_policy_attr_update_str_map{{lot_name, {2}}};
-		std::map<int64_t, std::vector<int>> man_policy_attr_update_int_map{{update_val, {1}}};
-		auto rp =
-			store_updates(man_policy_attr_update_stmt, man_policy_attr_update_str_map, man_policy_attr_update_int_map);
-		if (!rp.first) {
-			std::string int_err = rp.second;
-			std::string ext_err =
-				"Failure on call to lotman::Lot::store_updates when storing management policy attribute update: ";
-			return std::make_pair(false, ext_err + int_err);
-		}
-	} else {
-		return std::make_pair(false, "Update key not found or not recognized.");
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool committed =
+		storage.transaction([&] { return update_man_policy_attrs_in_txn(update_key, update_val, txn_error); });
+	if (!committed) {
+		return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
 	}
 	return std::make_pair(true, "");
+}
+
+bool lotman::Lot::update_man_policy_attrs_in_txn(const std::string &update_key, double update_val,
+												 std::string &txn_error) {
+	auto &storage = db::StorageManager::get_storage();
+	using namespace sqlite_orm;
+	auto mpa_ptr = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+	if (!mpa_ptr) {
+		txn_error = "Lot '" + lot_name + "' not found in management_policy_attributes";
+		return false;
+	}
+	auto mpa = *mpa_ptr;
+
+	// Contraction policy enforcement (inside transaction for consistency).
+	// Floating-point comparisons use a small epsilon so trivial round-trip noise
+	// (e.g. JSON re-parse) is not flagged as a contraction; integer fields are
+	// compared exactly.
+	std::string contraction_policy = Context::get_contraction_policy();
+	if (contraction_policy != "none" && !Context::get_admin_override()) {
+		constexpr double kContractionEps = 1e-9;
+		bool is_contraction = false;
+		if (update_key == "dedicated_GB" && update_val < mpa.dedicated_GB - kContractionEps)
+			is_contraction = true;
+		if (update_key == "opportunistic_GB" && update_val < mpa.opportunistic_GB - kContractionEps)
+			is_contraction = true;
+		if (update_key == "max_num_objects" && update_val < mpa.max_num_objects)
+			is_contraction = true;
+		if (update_key == "creation_time" && update_val > mpa.creation_time)
+			is_contraction = true;
+		if (update_key == "expiration_time" && update_val < mpa.expiration_time)
+			is_contraction = true;
+		if (update_key == "deletion_time" && update_val < mpa.deletion_time)
+			is_contraction = true;
+
+		if (is_contraction) {
+			if (contraction_policy == "always") {
+				txn_error = "Contraction policy 'always' blocks reduction of '" + update_key + "' on lot '" + lot_name +
+							"'. Set admin_override to bypass.";
+				return false;
+			}
+			if (contraction_policy == "alive") {
+				auto alive_rp = is_lot_alive(lot_name);
+				if (!alive_rp.second.empty()) {
+					txn_error = "Failed contraction policy check: " + alive_rp.second;
+					return false;
+				}
+				if (alive_rp.first) {
+					txn_error = "Contraction policy 'alive' blocks reduction of '" + update_key +
+								"' on currently-alive lot '" + lot_name + "'. Set admin_override to bypass.";
+					return false;
+				}
+			}
+		}
+	}
+
+	// Update the appropriate field
+	if (update_key == "dedicated_GB")
+		mpa.dedicated_GB = update_val;
+	else if (update_key == "opportunistic_GB")
+		mpa.opportunistic_GB = update_val;
+	else if (update_key == "max_num_objects")
+		mpa.max_num_objects = static_cast<int64_t>(update_val);
+	else if (update_key == "creation_time")
+		mpa.creation_time = static_cast<int64_t>(update_val);
+	else if (update_key == "expiration_time")
+		mpa.expiration_time = static_cast<int64_t>(update_val);
+	else if (update_key == "deletion_time")
+		mpa.deletion_time = static_cast<int64_t>(update_val);
+	else {
+		txn_error = "Update key not found or not recognized.";
+		return false;
+	}
+
+	// After updating a timestamp, verify half-open interval invariant
+	if (update_key == "creation_time" || update_key == "expiration_time") {
+		if (mpa.creation_time >= mpa.expiration_time) {
+			txn_error = "Update would make creation_time >= expiration_time on lot '" + lot_name +
+						"' (half-open interval [creation, expiration) must be non-empty)";
+			return false;
+		}
+	}
+
+	try {
+		storage.replace(mpa);
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to write MPA update: ") + e.what();
+		return false;
+	}
+
+	// If timestamps changed, re-check path temporal overlaps with other lots
+	if (update_key == "creation_time" || update_key == "expiration_time") {
+		auto lot_paths =
+			storage.get_all<db::Path>(where(c(&db::Path::lot_name) == lot_name and c(&db::Path::exclude) == false));
+		for (const auto &p : lot_paths) {
+			auto overlap = check_path_temporal_overlap(lot_name, p.path, mpa.creation_time, mpa.expiration_time);
+			if (!overlap.first) {
+				txn_error = "MPA update on '" + lot_name + "' would create path conflict: " + overlap.second;
+				return false;
+			}
+		}
+	}
+
+	// Re-validate axioms after MPA update
+	// check_children=true because changing this lot's MPAs can break axioms
+	// for children whose attributions reference this lot.
+	auto vr = apply_validation_predicates(build_axiom_predicates(lot_name, /*check_children=*/true));
+	if (!vr.first) {
+		txn_error = "MPA update on '" + lot_name + "' would violate hierarchy: " + vr.second;
+		return false;
+	}
+
+	return true;
 }
 
 std::pair<bool, std::string>
@@ -1203,6 +1673,12 @@ std::pair<bool, std::string> lotman::Lot::update_self_usage(const std::string &k
 
 	std::array<std::string, 2> allowed_int_keys = {"self_objects", "self_objects_being_written"};
 	std::array<std::string, 2> allowed_double_keys = {"self_GB", "self_GB_being_written"};
+
+	// Validate key before any SQL construction (defense-in-depth against column-name injection)
+	if (std::find(allowed_int_keys.begin(), allowed_int_keys.end(), key) == allowed_int_keys.end() &&
+		std::find(allowed_double_keys.begin(), allowed_double_keys.end(), key) == allowed_double_keys.end()) {
+		return std::make_pair(false, "Unrecognized usage key: " + key);
+	}
 
 	std::string children_key =
 		"children" + key.substr(4); // here, we strip out the "self" from the key to target the children col
@@ -1546,12 +2022,14 @@ std::pair<bool, std::string> lotman::Lot::recalculate_children_usage() {
 
 // END SECTION
 
-std::pair<bool, std::string> lotman::Lot::update_usage_by_dirs(const json &update_JSON, bool deltaMode) {
+std::pair<bool, std::string> lotman::Lot::update_usage_by_dirs(const json &update_JSON, bool deltaMode,
+															   int64_t query_time) {
 	// TODO: Should lots who don't show up when connecting lots to dirs be reset to have
 	//       0 usage, or should the be kept the way they are?
 	// --> kept the way they are, probably.
 
 	DirUsageUpdate dirUpdate;
+	dirUpdate.m_query_time = query_time;
 	std::vector<Lot> return_lots;
 	auto rp = dirUpdate.JSON_math(update_JSON, &return_lots);
 	if (!rp.first) {
@@ -1884,6 +2362,171 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_obj(
 	return std::make_pair(lots_past_obj, "");
 }
 
+// Helper: sort lot names by depth descending (deepest/leaf first).
+// Uses a single recursive CTE instead of N+1 individual queries.
+static void sort_by_depth_descending(std::vector<std::string> &lots) {
+	if (lots.empty())
+		return;
+
+	std::string depth_query = "WITH RECURSIVE depth_cte(lot_name, depth) AS ("
+							  "  SELECT lot_name, 0 FROM parents WHERE lot_name = parent "
+							  "  UNION ALL "
+							  "  SELECT p.lot_name, d.depth + 1 "
+							  "  FROM parents p JOIN depth_cte d ON p.parent = d.lot_name "
+							  "  WHERE p.lot_name != p.parent"
+							  ") "
+							  "SELECT lot_name, MAX(depth) FROM depth_cte GROUP BY lot_name ORDER BY MAX(depth) DESC;";
+
+	auto rp = lotman::db::SQL_get_matches_multi_col(depth_query, 2);
+	if (!rp.second.empty() || rp.first.empty())
+		return; // On error, leave unsorted
+
+	// Build lot_name → depth map
+	std::map<std::string, int> depth_map;
+	for (const auto &row : rp.first) {
+		if (row.size() >= 2) {
+			try {
+				depth_map[row[0]] = std::stoi(row[1]);
+			} catch (...) {
+				depth_map[row[0]] = 0;
+			}
+		}
+	}
+
+	std::sort(lots.begin(), lots.end(), [&depth_map](const std::string &a, const std::string &b) {
+		int da = depth_map.count(a) ? depth_map.at(a) : 0;
+		int db = depth_map.count(b) ? depth_map.at(b) : 0;
+		return da > db;
+	});
+}
+
+// Parameterized helper for hierarchical lot-threshold queries.
+// Builds an "adjusted usage" query that accounts for children's overage,
+// executes it, and returns results sorted by depth (deepest first).
+//
+// Parameters:
+//   self_usage_col: the lot_usage column for the lot's own usage (e.g. "self_GB")
+//   child_usage_expr: aggregate expression for a child's total usage
+//                     (e.g. "c_usage.self_GB + c_usage.children_GB")
+//   child_threshold_expr: the child's MPA threshold expression
+//                         (e.g. "c_mpa.dedicated_GB" or "c_mpa.dedicated_GB + c_mpa.opportunistic_GB")
+//   parent_threshold_expr: the parent's MPA threshold to compare against
+//                          (e.g. "p_mpa.dedicated_GB" or "p_mpa.dedicated_GB + p_mpa.opportunistic_GB")
+//   error_context: string for error messages
+static std::pair<std::vector<std::string>, std::string>
+get_lots_past_threshold_hierarchical(const std::string &self_usage_col, const std::string &child_usage_expr,
+									 const std::string &child_threshold_expr, const std::string &parent_threshold_expr,
+									 const std::string &error_context) {
+
+	// Defense-in-depth: validate all SQL fragments against known-good values.
+	// All callers pass compile-time constants, but this prevents future misuse.
+	static const std::set<std::string> allowed_usage_cols = {"self_GB", "self_objects"};
+	static const std::set<std::string> allowed_exprs = {"c_usage.self_GB + c_usage.children_GB",
+														"c_usage.self_objects + c_usage.children_objects",
+														"c_mpa.dedicated_GB",
+														"c_mpa.dedicated_GB + c_mpa.opportunistic_GB",
+														"c_mpa.max_num_objects",
+														"p_mpa.dedicated_GB",
+														"p_mpa.dedicated_GB + p_mpa.opportunistic_GB",
+														"p_mpa.max_num_objects"};
+
+	if (allowed_usage_cols.find(self_usage_col) == allowed_usage_cols.end() ||
+		allowed_exprs.find(child_usage_expr) == allowed_exprs.end() ||
+		allowed_exprs.find(child_threshold_expr) == allowed_exprs.end() ||
+		allowed_exprs.find(parent_threshold_expr) == allowed_exprs.end()) {
+		return std::make_pair(std::vector<std::string>(),
+							  "Internal error: unrecognized SQL fragment in hierarchical query");
+	}
+
+	std::string query = "SELECT p_usage.lot_name "
+						"FROM lot_usage p_usage "
+						"JOIN management_policy_attributes p_mpa ON p_usage.lot_name = p_mpa.lot_name "
+						"WHERE p_usage." +
+						self_usage_col +
+						" + COALESCE("
+						"    (SELECT SUM(MAX(0, (" +
+						child_usage_expr + ") - (" + child_threshold_expr +
+						"))) "
+						"     FROM parents c_par "
+						"     JOIN lot_usage c_usage ON c_par.lot_name = c_usage.lot_name "
+						"     JOIN management_policy_attributes c_mpa ON c_par.lot_name = c_mpa.lot_name "
+						"     WHERE c_par.parent = p_usage.lot_name AND c_par.lot_name != c_par.parent), 0"
+						") >= " +
+						parent_threshold_expr + ";";
+
+	auto rp = lotman::db::SQL_get_matches(query);
+	if (!rp.second.empty()) {
+		return std::make_pair(std::vector<std::string>(), "Failure on " + error_context + ": " + rp.second);
+	}
+
+	auto lots = rp.first;
+	sort_by_depth_descending(lots);
+	return std::make_pair(lots, "");
+}
+
+std::pair<std::vector<std::string>, std::string>
+lotman::Lot::get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool hierarchical) {
+	if (!hierarchical) {
+		return get_lots_past_ded(recursive_quota, recursive_children);
+	}
+	return get_lots_past_threshold_hierarchical("self_GB", "c_usage.self_GB + c_usage.children_GB",
+												"c_mpa.dedicated_GB", "p_mpa.dedicated_GB", "adjusted dedicated query");
+}
+
+std::pair<std::vector<std::string>, std::string>
+lotman::Lot::get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool hierarchical) {
+	if (!hierarchical) {
+		return get_lots_past_opp(recursive_quota, recursive_children);
+	}
+	return get_lots_past_threshold_hierarchical(
+		"self_GB", "c_usage.self_GB + c_usage.children_GB", "c_mpa.dedicated_GB + c_mpa.opportunistic_GB",
+		"p_mpa.dedicated_GB + p_mpa.opportunistic_GB", "adjusted opportunistic query");
+}
+
+std::pair<std::vector<std::string>, std::string>
+lotman::Lot::get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool hierarchical) {
+	if (!hierarchical) {
+		return get_lots_past_obj(recursive_quota, recursive_children);
+	}
+	return get_lots_past_threshold_hierarchical("self_objects", "c_usage.self_objects + c_usage.children_objects",
+												"c_mpa.max_num_objects", "p_mpa.max_num_objects",
+												"adjusted objects query");
+}
+
+std::pair<json, std::string> lotman::Lot::get_available_capacity(const std::string &parent_lot_name, int64_t start_time,
+																 int64_t end_time) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		// Get parent's MPAs
+		auto parent_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(parent_lot_name);
+		if (!parent_mpa) {
+			return std::make_pair(json(), "Parent lot '" + parent_lot_name + "' not found");
+		}
+
+		// Build sweep-line events from children's attributions, clipped to query window
+		auto events = build_attribution_events(parent_lot_name, start_time, end_time);
+		auto peak = run_sweep_line(events);
+
+		json result;
+		result["available_dedicated_GB"] = parent_mpa->dedicated_GB - peak.peak_ded;
+		result["available_opportunistic_GB"] = parent_mpa->opportunistic_GB - peak.peak_opp;
+		result["available_max_num_objects"] = parent_mpa->max_num_objects - static_cast<int64_t>(peak.peak_obj);
+		result["peak_dedicated_GB"] = peak.peak_ded;
+		result["peak_opportunistic_GB"] = peak.peak_opp;
+		result["peak_max_num_objects"] = static_cast<int64_t>(peak.peak_obj);
+		// peak_total is the true max of (ded+opp) at a single point in time
+		double parent_total = parent_mpa->dedicated_GB + parent_mpa->opportunistic_GB;
+		result["available_total_GB"] = parent_total - peak.peak_total;
+		result["peak_total_GB"] = peak.peak_total;
+
+		return std::make_pair(result, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(json(), std::string("get_available_capacity failed: ") + e.what());
+	}
+}
+
 std::pair<std::vector<std::string>, std::string> lotman::Lot::list_all_lots() {
 	try {
 		auto &storage = db::StorageManager::get_storage();
@@ -1895,8 +2538,8 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::list_all_lots() {
 	}
 }
 
-std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_from_dir(const std::string &dir_input,
-																				const bool recursive) {
+std::pair<std::vector<std::string>, std::string>
+lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursive, int64_t query_time) {
 	// Normalize: ensure input dir has trailing slash for consistent comparison
 	// Database paths always have trailing slashes (e.g., "/foo/bar/")
 	std::string dir = ensure_trailing_slash(dir_input);
@@ -1929,14 +2572,17 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_from_dir(
 	//
 	// We select the longest non-excluded path that doesn't have a longer exclusion overriding it
 	std::string lots_from_dir_query =
-		"SELECT lot_name FROM paths p "
+		"SELECT p.lot_name FROM paths p "
+		"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
 		"WHERE "
 		"(p.path = ?1 OR ?2 LIKE p.path || '%') " // Exact match or subdirectory of stored path
 		"AND "
 		"(p.recursive OR p.path = ?3) " // If not recursive, only match exact path
 		"AND "
-		"p.exclude = 0 "	// Only consider inclusion paths
-		"AND NOT EXISTS ( " // Ensure no longer exclusion overrides this inclusion
+		"p.exclude = 0 "				// Only consider inclusion paths
+		"AND mpa.creation_time <= ?4 "	// Lot must have started
+		"AND mpa.expiration_time > ?4 " // Lot must not have expired
+		"AND NOT EXISTS ( "				// Ensure no longer exclusion overrides this inclusion
 		"    SELECT 1 FROM paths e "
 		"    WHERE e.lot_name = p.lot_name "			  // Same lot
 		"    AND e.exclude = 1 "						  // Is an exclusion
@@ -1946,7 +2592,8 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_from_dir(
 		") "
 		"ORDER BY LENGTH(p.path) DESC LIMIT 1;"; // Prefer longest matching inclusion
 	std::map<std::string, std::vector<int>> dir_str_map{{dir, {1, 3}}, {dir_for_like, {2}}};
-	auto rp = lotman::db::SQL_get_matches(lots_from_dir_query, dir_str_map);
+	std::map<int64_t, std::vector<int>> dir_int_map{{query_time, {4}}};
+	auto rp = lotman::db::SQL_get_matches(lots_from_dir_query, dir_str_map, dir_int_map);
 	if (!rp.second.empty()) {
 		std::string int_err = rp.second;
 		std::string ext_err = "Failure on call to SQL_get_matches: ";
@@ -2162,6 +2809,515 @@ std::pair<bool, std::string> lotman::Lot::check_context_for_children(const std::
 }
 
 /**
+ * Strict Hierarchy Enforcement Methods
+ */
+
+std::pair<bool, std::string> lotman::Lot::compute_and_store_attributions(const json &parent_attributions_json) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		// Get non-self parents
+		std::vector<std::string> non_self_parents;
+		for (const auto &p : parents) {
+			if (p != lot_name) {
+				non_self_parents.push_back(p);
+			}
+		}
+
+		// If no non-self parents (root lot), nothing to attribute
+		if (non_self_parents.empty()) {
+			return std::make_pair(true, "");
+		}
+
+		// Validate that parent_attributions_json contains only known parent keys
+		if (!parent_attributions_json.is_null() && parent_attributions_json.is_object()) {
+			for (auto it = parent_attributions_json.begin(); it != parent_attributions_json.end(); ++it) {
+				const auto &key = it.key();
+				if (std::find(non_self_parents.begin(), non_self_parents.end(), key) == non_self_parents.end()) {
+					return std::make_pair(false, "Attribution JSON contains unknown parent '" + key +
+													 "' which is not a current non-self parent of lot '" + lot_name +
+													 "'");
+				}
+			}
+		}
+
+		// Remove any existing attributions for this child
+		storage.remove_all<db::ParentChildAttribution>(
+			where(c(&db::ParentChildAttribution::child_lot_name) == lot_name));
+
+		// The three MPA keys we track attributions for
+		const std::vector<std::string> mpa_keys = {"dedicated_GB", "opportunistic_GB", "max_num_objects"};
+		const std::map<std::string, double> child_mpas = {
+			{"dedicated_GB", man_policy_attr.dedicated_GB},
+			{"opportunistic_GB", man_policy_attr.opportunistic_GB},
+			{"max_num_objects", static_cast<double>(man_policy_attr.max_num_objects)}};
+
+		for (const auto &mpa_key : mpa_keys) {
+			double total_child_value = child_mpas.at(mpa_key);
+			double explicitly_attributed = 0.0;
+			std::vector<std::string> unspecified_parents;
+
+			// Process explicit attributions
+			for (const auto &parent_name : non_self_parents) {
+				if (!parent_attributions_json.is_null() && parent_attributions_json.contains(parent_name) &&
+					parent_attributions_json[parent_name].contains(mpa_key)) {
+
+					double explicit_value = parent_attributions_json[parent_name][mpa_key].get<double>();
+					double fraction = (total_child_value > 0) ? explicit_value / total_child_value : 0.0;
+
+					db::ParentChildAttribution attr;
+					attr.child_lot_name = lot_name;
+					attr.parent_lot_name = parent_name;
+					attr.mpa_key = mpa_key;
+					attr.fraction = fraction;
+					storage.replace(attr);
+
+					explicitly_attributed += explicit_value;
+				} else {
+					unspecified_parents.push_back(parent_name);
+				}
+			}
+
+			// If all parents were explicitly attributed, verify the sum matches the total
+			// (no shortfall and no overage). An overage would mean the child's MPA is being
+			// double-counted across parents, which violates the attribution invariant.
+			if (unspecified_parents.empty() && total_child_value > 0) {
+				double shortfall = total_child_value - explicitly_attributed;
+				if (shortfall > 1e-9) {
+					return std::make_pair(
+						false, "Explicit attributions for '" + mpa_key + "' sum to " +
+								   std::to_string(explicitly_attributed) + " but child's total is " +
+								   std::to_string(total_child_value) +
+								   "; all parents are explicitly attributed so remainder cannot be distributed");
+				}
+				double overage = explicitly_attributed - total_child_value;
+				if (overage > 1e-9) {
+					return std::make_pair(
+						false, "Explicit attributions for '" + mpa_key + "' sum to " +
+								   std::to_string(explicitly_attributed) + " which exceeds child's total of " +
+								   std::to_string(total_child_value) +
+								   "; attributions cannot exceed the child's allocation (would double-count).");
+				}
+			}
+
+			// Distribute remainder equally among unspecified parents
+			if (!unspecified_parents.empty()) {
+				double remainder = total_child_value - explicitly_attributed;
+				if (remainder < -1e-9) {
+					return std::make_pair(false, "Explicit attributions for '" + mpa_key +
+													 "' exceed the child's total allocation");
+				}
+				if (remainder < 0)
+					remainder = 0; // floating point tolerance
+
+				double per_parent = remainder / unspecified_parents.size();
+				// For max_num_objects, handle integer remainder
+				int64_t int_per_parent = 0;
+				int64_t int_remainder_extra = 0;
+				if (mpa_key == "max_num_objects") {
+					int64_t int_remainder = static_cast<int64_t>(remainder);
+					int_per_parent = int_remainder / static_cast<int64_t>(unspecified_parents.size());
+					int_remainder_extra = int_remainder % static_cast<int64_t>(unspecified_parents.size());
+				}
+
+				for (size_t i = 0; i < unspecified_parents.size(); ++i) {
+					double value;
+					if (mpa_key == "max_num_objects") {
+						value = static_cast<double>(int_per_parent +
+													(static_cast<int64_t>(i) < int_remainder_extra ? 1 : 0));
+					} else {
+						value = per_parent;
+					}
+
+					double fraction = (total_child_value > 0) ? value / total_child_value : 0.0;
+
+					db::ParentChildAttribution attr;
+					attr.child_lot_name = lot_name;
+					attr.parent_lot_name = unspecified_parents[i];
+					attr.mpa_key = mpa_key;
+					attr.fraction = fraction;
+					storage.replace(attr);
+				}
+			}
+		}
+
+		return std::make_pair(true, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(false, std::string("Failed to compute attributions: ") + e.what());
+	}
+}
+
+std::pair<bool, std::string> lotman::Lot::update_attributions(const json &parent_attributions_json) {
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool committed =
+		storage.transaction([&] { return update_attributions_in_txn(parent_attributions_json, txn_error); });
+	if (!committed) {
+		return std::make_pair(false, txn_error.empty() ? "Transaction failed" : txn_error);
+	}
+	return std::make_pair(true, "");
+}
+
+bool lotman::Lot::update_attributions_in_txn(const json &parent_attributions_json, std::string &txn_error) {
+	try {
+		// Load the lot's current MPAs and parents from DB
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		auto mpa_ptr = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+		if (!mpa_ptr) {
+			txn_error = "Lot '" + lot_name + "' not found in management_policy_attributes";
+			return false;
+		}
+		man_policy_attr.dedicated_GB = mpa_ptr->dedicated_GB;
+		man_policy_attr.opportunistic_GB = mpa_ptr->opportunistic_GB;
+		man_policy_attr.max_num_objects = mpa_ptr->max_num_objects;
+
+		// Load parents
+		auto parent_records = storage.select(&db::Parent::parent, where(c(&db::Parent::lot_name) == lot_name));
+		parents.clear();
+		for (const auto &p : parent_records) {
+			parents.push_back(p);
+		}
+
+		auto rp = compute_and_store_attributions(parent_attributions_json);
+		if (!rp.first) {
+			txn_error = rp.second;
+			return false;
+		}
+
+		// Re-validate axioms 1 and 2 (not 3 — timestamps are unchanged)
+		if (Context::get_strict_hierarchy()) {
+			const std::string &name = lot_name;
+			std::vector<ValidationPredicate> predicates = {[name]() { return validate_axiom1(name); },
+														   [name]() { return validate_axiom2_for_parents_of(name); }};
+			auto vr = apply_validation_predicates(predicates);
+			if (!vr.first) {
+				txn_error = vr.second;
+				return false;
+			}
+		}
+
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to update attributions: ") + e.what();
+		return false;
+	}
+}
+
+std::pair<bool, std::string> lotman::Lot::is_lot_alive(const std::string &lot_name) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+		auto mpa = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+		if (!mpa) {
+			return std::make_pair(false, "");
+		}
+		auto now =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+				.count();
+		return std::make_pair(mpa->creation_time <= now && now < mpa->expiration_time, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(false, std::string("Failed to check lot alive status: ") + e.what());
+	}
+}
+
+std::pair<bool, std::string> lotman::Lot::check_contraction_for_deletion(const std::string &lot_name) {
+	std::string contraction_policy = Context::get_contraction_policy();
+	if (contraction_policy == "none" || Context::get_admin_override()) {
+		return std::make_pair(true, "");
+	}
+
+	if (contraction_policy == "always") {
+		return std::make_pair(false,
+							  "Contraction policy 'always' blocks deletion of lot '" + lot_name +
+								  "'. Deletion is treated as contraction to zero. Set admin_override to bypass.");
+	}
+
+	if (contraction_policy == "alive") {
+		auto alive_rp = is_lot_alive(lot_name);
+		if (!alive_rp.second.empty()) {
+			return std::make_pair(false,
+								  std::string("Failed contraction policy check for deletion: ") + alive_rp.second);
+		}
+		if (alive_rp.first) {
+			return std::make_pair(false, "Contraction policy 'alive' blocks deletion of currently-alive lot '" +
+											 lot_name + "'. Set admin_override to bypass.");
+		}
+	}
+
+	return std::make_pair(true, "");
+}
+
+std::pair<bool, std::string>
+lotman::Lot::apply_validation_predicates(const std::vector<ValidationPredicate> &predicates) {
+	for (const auto &pred : predicates) {
+		auto result = pred();
+		if (!result.first) {
+			return result;
+		}
+	}
+	return std::make_pair(true, "");
+}
+
+std::vector<lotman::Lot::ValidationPredicate> lotman::Lot::build_axiom_predicates(const std::string &lot_name,
+																				  bool check_children) {
+	std::vector<ValidationPredicate> predicates;
+
+	if (!Context::get_strict_hierarchy()) {
+		return predicates;
+	}
+
+	predicates.push_back([lot_name]() { return validate_axiom1(lot_name); });
+	predicates.push_back([lot_name]() { return validate_axiom2_for_parents_of(lot_name); });
+	predicates.push_back([lot_name]() { return validate_axiom3(lot_name); });
+
+	if (check_children) {
+		predicates.push_back([lot_name]() -> std::pair<bool, std::string> {
+			Lot lot(lot_name);
+			auto children_rp = lot.get_children(false);
+			if (!children_rp.second.empty()) {
+				return std::make_pair(false, "Failed to get children for '" + lot_name + "': " + children_rp.second);
+			}
+			for (const auto &child : lot.self_children) {
+				auto a1 = validate_axiom1(child.lot_name);
+				if (!a1.first)
+					return a1;
+				auto a2 = validate_axiom2_for_parents_of(child.lot_name);
+				if (!a2.first)
+					return a2;
+				auto a3 = validate_axiom3(child.lot_name);
+				if (!a3.first)
+					return a3;
+			}
+			return std::make_pair(true, "");
+		});
+	}
+
+	return predicates;
+}
+
+std::pair<bool, std::string> lotman::Lot::validate_axiom1(const std::string &child_lot_name) {
+	// Axiom 1: For each parent P of child C, the attributed amount from C to P
+	// must not exceed P's own MPAs.
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		// Get child's MPAs
+		auto child_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(child_lot_name);
+		if (!child_mpa) {
+			return std::make_pair(false, "Child lot '" + child_lot_name + "' not found");
+		}
+
+		// Get non-self parents from the parents table (authoritative source)
+		auto parent_records = storage.select(&db::Parent::parent, where(c(&db::Parent::lot_name) == child_lot_name));
+
+		// Get all attributions for this child
+		auto attributions = storage.get_all<db::ParentChildAttribution>(
+			where(c(&db::ParentChildAttribution::child_lot_name) == child_lot_name));
+
+		// Group by parent
+		std::map<std::string, std::map<std::string, double>> parent_attributed; // parent -> {mpa_key -> fraction}
+		for (const auto &attr : attributions) {
+			parent_attributed[attr.parent_lot_name][attr.mpa_key] = attr.fraction;
+		}
+
+		// Iterate over actual parents from the parents table, not just attribution rows
+		for (const auto &parent_name : parent_records) {
+			if (parent_name == child_lot_name)
+				continue; // skip self-parent
+
+			// Ensure this parent has attribution rows
+			if (parent_attributed.find(parent_name) == parent_attributed.end()) {
+				return std::make_pair(false, "Hierarchy attribution error: parent lot '" + parent_name +
+												 "' has no attribution rows for child lot '" + child_lot_name +
+												 "'; attribution data may be missing or stale.");
+			}
+
+			const auto &fractions = parent_attributed.at(parent_name);
+			auto parent_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(parent_name);
+			if (!parent_mpa) {
+				return std::make_pair(false, "Parent lot '" + parent_name + "' not found");
+			}
+
+			// Compute attributed values
+			double attr_ded =
+				fractions.count("dedicated_GB") ? fractions.at("dedicated_GB") * child_mpa->dedicated_GB : 0.0;
+			double attr_opp = fractions.count("opportunistic_GB")
+								  ? fractions.at("opportunistic_GB") * child_mpa->opportunistic_GB
+								  : 0.0;
+			double attr_obj = fractions.count("max_num_objects")
+								  ? std::round(fractions.at("max_num_objects") * child_mpa->max_num_objects)
+								  : 0.0;
+
+			// Check: attributed dedicated ≤ parent dedicated
+			if (attr_ded > parent_mpa->dedicated_GB + 1e-9) {
+				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name + "' attributes " +
+												 std::to_string(attr_ded) + " dedicated_GB to parent lot '" +
+												 parent_name +
+												 "', which exceeds the parent's dedicated_GB allocation of " +
+												 std::to_string(parent_mpa->dedicated_GB) +
+												 ". A child lot's allocation may not exceed any parent's.");
+			}
+
+			// Check: attributed (ded+opp) ≤ parent (ded+opp)
+			double attr_total = attr_ded + attr_opp;
+			double parent_total = parent_mpa->dedicated_GB + parent_mpa->opportunistic_GB;
+			if (attr_total > parent_total + 1e-9) {
+				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name + "' attributes " +
+												 std::to_string(attr_total) +
+												 " total GB (dedicated + opportunistic) to parent lot '" + parent_name +
+												 "', which exceeds the parent's combined allocation of " +
+												 std::to_string(parent_total) +
+												 " GB. A child lot's allocation may not exceed any parent's.");
+			}
+
+			// Check: attributed objects ≤ parent objects
+			if (attr_obj > parent_mpa->max_num_objects) {
+				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name + "' attributes " +
+												 std::to_string(static_cast<int64_t>(attr_obj)) +
+												 " max_num_objects to parent lot '" + parent_name +
+												 "', which exceeds the parent's max_num_objects allocation of " +
+												 std::to_string(parent_mpa->max_num_objects) +
+												 ". A child lot's allocation may not exceed any parent's.");
+			}
+		}
+
+		return std::make_pair(true, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(false,
+							  std::string("Hierarchy validation (per-parent allocation check) failed: ") + e.what());
+	}
+}
+
+std::pair<bool, std::string> lotman::Lot::validate_axiom2_for_parents_of(const std::string &child_lot_name) {
+	// Axiom 2 (time-aware): For each parent P, at no point in time may the sum of
+	// concurrently-active children's attributed MPAs exceed P's own MPAs.
+	// Uses a sweep-line over children's [creation_time, expiration_time) intervals.
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		// Get the parents of this child (non-self)
+		auto parent_records = storage.select(&db::Parent::parent, where(c(&db::Parent::lot_name) == child_lot_name));
+
+		for (const auto &parent_name : parent_records) {
+			if (parent_name == child_lot_name)
+				continue; // skip self-parent
+
+			auto parent_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(parent_name);
+			if (!parent_mpa) {
+				return std::make_pair(false, "Parent lot '" + parent_name + "' not found");
+			}
+
+			// Build sweep-line events from children's attributions
+			auto events = build_attribution_events(parent_name);
+			auto peak = run_sweep_line(events);
+
+			// Check: peak dedicated ≤ parent dedicated
+			if (peak.peak_ded > parent_mpa->dedicated_GB + 1e-9) {
+				return std::make_pair(
+					false, "Hierarchy violation: peak concurrent dedicated_GB across children of parent lot '" +
+							   parent_name + "' is " + std::to_string(peak.peak_ded) +
+							   ", which exceeds the parent's dedicated_GB allocation of " +
+							   std::to_string(parent_mpa->dedicated_GB) +
+							   ". The combined allocations of children active at the same time may not exceed the "
+							   "parent's capacity.");
+			}
+
+			// Check: peak (ded+opp) ≤ parent (ded+opp)
+			// Use peak_total which is the true max of (ded+opp) at a single point in time,
+			// not the sum of independent peaks which can occur at different times.
+			double parent_total = parent_mpa->dedicated_GB + parent_mpa->opportunistic_GB;
+			if (peak.peak_total > parent_total + 1e-9) {
+				return std::make_pair(false, "Hierarchy violation: peak concurrent total GB (dedicated + "
+											 "opportunistic) across children of parent lot '" +
+												 parent_name + "' is " + std::to_string(peak.peak_total) +
+												 ", which exceeds the parent's combined allocation of " +
+												 std::to_string(parent_total) +
+												 " GB. The combined allocations of children active at the same time "
+												 "may not exceed the parent's capacity.");
+			}
+
+			// Check: peak objects ≤ parent objects
+			if (std::round(peak.peak_obj) > parent_mpa->max_num_objects) {
+				return std::make_pair(
+					false, "Hierarchy violation: peak concurrent max_num_objects across children of parent lot '" +
+							   parent_name + "' is " + std::to_string(static_cast<int64_t>(peak.peak_obj)) +
+							   ", which exceeds the parent's max_num_objects allocation of " +
+							   std::to_string(parent_mpa->max_num_objects) +
+							   ". The combined allocations of children active at the same time may not exceed the "
+							   "parent's capacity.");
+			}
+		}
+
+		return std::make_pair(true, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(false, std::string("Hierarchy validation (concurrent children capacity check) failed: ") +
+										 e.what());
+	}
+}
+
+std::pair<bool, std::string> lotman::Lot::validate_axiom3(const std::string &child_lot_name) {
+	// Axiom 3: A child lot's timestamps must fit within all parents' timestamps:
+	// child.creation_time ≥ parent.creation_time
+	// child.expiration_time ≤ parent.expiration_time
+	// child.deletion_time ≤ parent.deletion_time
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		auto child_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(child_lot_name);
+		if (!child_mpa) {
+			return std::make_pair(false, "Child lot '" + child_lot_name + "' not found");
+		}
+
+		auto parent_records = storage.select(&db::Parent::parent, where(c(&db::Parent::lot_name) == child_lot_name));
+
+		for (const auto &parent_name : parent_records) {
+			if (parent_name == child_lot_name)
+				continue; // skip self-parent
+
+			auto parent_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(parent_name);
+			if (!parent_mpa) {
+				return std::make_pair(false, "Parent lot '" + parent_name + "' not found");
+			}
+
+			if (child_mpa->creation_time < parent_mpa->creation_time) {
+				return std::make_pair(
+					false, "Hierarchy violation: child lot '" + child_lot_name + "' has a creation_time (" +
+							   std::to_string(child_mpa->creation_time) + ") earlier than parent lot '" + parent_name +
+							   "' creation_time (" + std::to_string(parent_mpa->creation_time) +
+							   "). A child lot's time window must be contained within every parent's time window.");
+			}
+
+			if (child_mpa->expiration_time > parent_mpa->expiration_time) {
+				return std::make_pair(
+					false, "Hierarchy violation: child lot '" + child_lot_name + "' has an expiration_time (" +
+							   std::to_string(child_mpa->expiration_time) + ") later than parent lot '" + parent_name +
+							   "' expiration_time (" + std::to_string(parent_mpa->expiration_time) +
+							   "). A child lot's time window must be contained within every parent's time window.");
+			}
+
+			if (child_mpa->deletion_time > parent_mpa->deletion_time) {
+				return std::make_pair(
+					false, "Hierarchy violation: child lot '" + child_lot_name + "' has a deletion_time (" +
+							   std::to_string(child_mpa->deletion_time) + ") later than parent lot '" + parent_name +
+							   "' deletion_time (" + std::to_string(parent_mpa->deletion_time) +
+							   "). A child lot's time window must be contained within every parent's time window.");
+			}
+		}
+
+		return std::make_pair(true, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(false,
+							  std::string("Hierarchy validation (time window containment check) failed: ") + e.what());
+	}
+}
+
+/**
  * Functions specific to Checks class
  */
 
@@ -2267,6 +3423,22 @@ bool lotman::Checks::will_be_orphaned(const std::string &LTBR, const std::string
 
 void lotman::Context::set_caller(const std::string caller) {
 	m_caller = std::make_shared<std::string>(caller);
+}
+
+void lotman::Context::set_strict_hierarchy(bool enabled) {
+	m_strict_hierarchy = enabled;
+}
+
+std::pair<bool, std::string> lotman::Context::set_contraction_policy(const std::string &policy) {
+	if (policy != "none" && policy != "alive" && policy != "always") {
+		return std::make_pair(false, "Contraction policy must be one of: 'none', 'alive', 'always'. Got: " + policy);
+	}
+	m_contraction_policy = policy;
+	return std::make_pair(true, "");
+}
+
+void lotman::Context::set_admin_override(bool enabled) {
+	m_admin_override = enabled;
 }
 
 std::pair<bool, std::string> lotman::Context::set_lot_home(const std::string dir_path) {
