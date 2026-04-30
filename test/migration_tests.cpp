@@ -439,7 +439,7 @@ TEST_F(MigrationTest, TestPathLookupWithoutTrailingSlash) {
 
 	// Test lookup WITHOUT trailing slash
 	char **output = nullptr;
-	rv = lotman_get_lots_from_dir("/test/path", false, &output, &raw_err);
+	rv = lotman_get_lots_from_dir("/test/path", false, 1750000000, &output, &raw_err);
 	UniqueCString err5(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed to get lots from dir: " << (err5.get() ? err5.get() : "unknown error");
 	ASSERT_NE(output, nullptr);
@@ -448,7 +448,7 @@ TEST_F(MigrationTest, TestPathLookupWithoutTrailingSlash) {
 
 	// Test lookup WITH trailing slash
 	output = nullptr;
-	rv = lotman_get_lots_from_dir("/test/path/", false, &output, &raw_err);
+	rv = lotman_get_lots_from_dir("/test/path/", false, 1750000000, &output, &raw_err);
 	UniqueCString err6(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed to get lots from dir: " << (err6.get() ? err6.get() : "unknown error");
 	ASSERT_NE(output, nullptr);
@@ -457,7 +457,7 @@ TEST_F(MigrationTest, TestPathLookupWithoutTrailingSlash) {
 
 	// Test subdirectory lookup (recursive path)
 	output = nullptr;
-	rv = lotman_get_lots_from_dir("/test/path/subdir", false, &output, &raw_err);
+	rv = lotman_get_lots_from_dir("/test/path/subdir", false, 1750000000, &output, &raw_err);
 	UniqueCString err7(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed to get lots from dir: " << (err7.get() ? err7.get() : "unknown error");
 	ASSERT_NE(output, nullptr);

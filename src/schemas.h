@@ -5,7 +5,34 @@ using json_validator = nlohmann::json_schema::json_validator;
 
 namespace lotman_schemas {
 
-json new_lot_schema = R"(
+// Shared schema fragment for parent_attributions, used by new_lot_schema,
+// lot_update_schema, and lot_additions_schema.
+const json parent_attributions_def = R"({
+    "description": "How the child's MPAs are attributed across its parents. Keys are parent lot names.",
+    "type": "object",
+    "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "dedicated_GB": {
+                "type": "number",
+                "minimum": 0
+            },
+            "opportunistic_GB": {
+                "type": "number",
+                "minimum": 0
+            },
+            "max_num_objects": {
+                "type": "number",
+                "minimum": 0,
+                "multipleOf": 1
+            }
+        }
+    }
+})"_json;
+
+inline json new_lot_schema = []() {
+	json s = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -106,8 +133,12 @@ json new_lot_schema = R"(
     "required": ["lot_name", "owner", "parents", "management_policy_attrs"]
 }
 )"_json;
+	s["properties"]["parent_attributions"] = parent_attributions_def;
+	return s;
+}();
 
-json lot_update_schema = R"(
+inline json lot_update_schema = []() {
+	json s = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -217,8 +248,15 @@ json lot_update_schema = R"(
     "required": ["lot_name"]
 }
 )"_json;
+	// `parent_attributions` is accepted in the same envelope as the rest of the
+	// update payload (see lotman_update_lot). Wholesale-replace semantics: any
+	// parent omitted from this object gets the equal-split remainder of the
+	// child's MPAs.
+	s["properties"]["parent_attributions"] = parent_attributions_def;
+	return s;
+}();
 
-json lot_rm_parents_schema = R"(
+inline json lot_rm_parents_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -244,7 +282,7 @@ json lot_rm_parents_schema = R"(
 }
 )"_json;
 
-json lot_rm_paths_schema = R"(
+inline json lot_rm_paths_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -264,7 +302,8 @@ json lot_rm_paths_schema = R"(
 }
 )"_json;
 
-json lot_additions_schema = R"(
+inline json lot_additions_schema = []() {
+	json s = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -314,8 +353,13 @@ json lot_additions_schema = R"(
     "required": ["lot_name"]
 }
 )"_json;
+	// Allow callers to specify per-parent shares for the post-addition lot;
+	// any parent omitted from this object gets the equal-split remainder.
+	s["properties"]["parent_attributions"] = parent_attributions_def;
+	return s;
+}();
 
-json get_policy_attrs_schema = R"(
+inline json get_policy_attrs_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -362,7 +406,7 @@ json get_policy_attrs_schema = R"(
 }
 )"_json;
 
-json get_usage_schema = R"(
+inline json get_usage_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -409,7 +453,7 @@ json get_usage_schema = R"(
 }
 )"_json;
 
-json update_usage_schema = R"(
+inline json update_usage_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -448,7 +492,7 @@ json update_usage_schema = R"(
 }
 )"_json;
 
-json update_usage_delta_schema = R"(
+inline json update_usage_delta_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -490,7 +534,7 @@ NOTE: This schema only validates a single top level object, but does get the arr
 TODO: Fix this so it validates the top level array instead of validating each individualobject
 	  in the array
 */
-json update_usage_by_dir_schema = R"(
+inline json update_usage_by_dir_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -529,7 +573,7 @@ json update_usage_by_dir_schema = R"(
 }
 )"_json;
 
-json update_usage_by_dir_delta_schema = R"(
+inline json update_usage_by_dir_delta_schema = R"(
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
