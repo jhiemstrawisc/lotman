@@ -861,7 +861,7 @@ TEST_F(LotManTest, SetGetUsageTest) {
 		}
 	])";
 	raw_err = nullptr;
-	rv = lotman_update_lot_usage_by_dir(update_JSON_str, deltaMode, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(update_JSON_str, deltaMode, 150, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 
@@ -922,7 +922,7 @@ TEST_F(LotManTest, SetGetUsageTest) {
 		"subdirs": []
 	}])";
 	raw_err = nullptr;
-	rv = lotman_update_lot_usage_by_dir(update2_JSON_str, deltaMode, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(update2_JSON_str, deltaMode, 150, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 
@@ -946,7 +946,7 @@ TEST_F(LotManTest, SetGetUsageTest) {
 		"subdirs": []
 	}])";
 	raw_err = nullptr;
-	rv = lotman_update_lot_usage_by_dir(update3_JSON_str, deltaMode, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(update3_JSON_str, deltaMode, 150, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_NE(rv, 0) << err_msg.get();
 }
@@ -1297,7 +1297,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past opportunistic storage limit
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_opp(true, true, &raw_output, &raw_err);
+	rv = lotman_get_lots_past_opp(true, true, &raw_output, false, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output3(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1313,7 +1313,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past dedicated storage limit
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_ded(true, true, &raw_output, &raw_err);
+	rv = lotman_get_lots_past_ded(true, true, &raw_output, false, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output4(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1329,7 +1329,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past object storage limit
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_obj(true, true, &raw_output, &raw_err);
+	rv = lotman_get_lots_past_obj(true, true, &raw_output, false, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output5(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1433,7 +1433,7 @@ TEST_F(LotManTest, GetLotJSONTest) {
 		"subdirs": []
 	}])";
 	raw_err = nullptr;
-	rv = lotman_update_lot_usage_by_dir(update_JSON_str, false, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(update_JSON_str, false, 150, &raw_err);
 	setup_err.reset(raw_err);
 	ASSERT_EQ(rv, 0) << setup_err.get();
 
@@ -1446,7 +1446,7 @@ TEST_F(LotManTest, GetLotJSONTest) {
 		"subdirs": []
 	}])";
 	raw_err = nullptr;
-	rv = lotman_update_lot_usage_by_dir(update2_JSON_str, true, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(update2_JSON_str, true, 150, &raw_err);
 	setup_err.reset(raw_err);
 	ASSERT_EQ(rv, 0) << setup_err.get();
 
@@ -1491,14 +1491,14 @@ TEST_F(LotManTest, GetLotJSONTest) {
 			{
 				"exclude": false,
 				"lot_name": "lot3",
-				"path": "/updated/path/",
-				"recursive": false
+				"path": "/foo/barr/",
+				"recursive": true
 			},
 			{
 				"exclude": false,
 				"lot_name": "lot3",
-				"path": "/foo/barr/",
-				"recursive": true
+				"path": "/updated/path/",
+				"recursive": false
 			}
 		],
 		"usage": {
@@ -1552,14 +1552,14 @@ TEST_F(LotManTest, GetLotJSONTest) {
 			{
 				"exclude": false,
 				"lot_name": "lot3",
-				"path": "/updated/path/",
-				"recursive": false
+				"path": "/foo/barr/",
+				"recursive": true
 			},
 			{
 				"exclude": false,
 				"lot_name": "lot3",
-				"path": "/foo/barr/",
-				"recursive": true
+				"path": "/updated/path/",
+				"recursive": false
 			},
 			{
 				"exclude": false,
@@ -1675,7 +1675,7 @@ TEST_F(LotManTest, LotsFromDirTest) {
 	char **raw_output = nullptr;
 	raw_err = nullptr;
 	const char *dir = "/1/2/3/4"; // Get a path
-	rv = lotman_get_lots_from_dir(dir, true, &raw_output, &raw_err);
+	rv = lotman_get_lots_from_dir(dir, true, 150, &raw_output, &raw_err);
 	UniqueCString err_msg(raw_err);
 	UniqueStringList output(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1692,7 +1692,7 @@ TEST_F(LotManTest, LotsFromDirTest) {
 	raw_output = nullptr;
 	raw_err = nullptr;
 	const char *dir2 = "/foo/barr"; // Make sure parsing doesn't grab lot associated with /foo/bar
-	rv = lotman_get_lots_from_dir(dir2, false, &raw_output, &raw_err);
+	rv = lotman_get_lots_from_dir(dir2, false, 150, &raw_output, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output2(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1932,7 +1932,7 @@ TEST_F(LotManTest, PathTrailingSlashNormalizationTest) {
 
 	// Verify lookup works WITHOUT trailing slash
 	char **lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/no/slash/here", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/no/slash/here", false, 1750000000, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -1941,7 +1941,7 @@ TEST_F(LotManTest, PathTrailingSlashNormalizationTest) {
 
 	// Verify lookup works WITH trailing slash
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/no/slash/here/", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/no/slash/here/", false, 1750000000, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -1950,7 +1950,7 @@ TEST_F(LotManTest, PathTrailingSlashNormalizationTest) {
 
 	// Verify subdirectory lookup works (for recursive path)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/no/slash/here/subdir/deeper", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/no/slash/here/subdir/deeper", false, 1750000000, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2051,7 +2051,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// Test get_lots_from_dir: /data/storage should return the lot
 	char **lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2060,7 +2060,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// Test get_lots_from_dir: /data/storage/subdir should return the lot (recursive, not excluded)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage/subdir", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage/subdir", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2070,7 +2070,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 	// Test get_lots_from_dir: /data/storage/cache itself should NOT return exclusion_lot (excluded)
 	// It should return "default" since the path is excluded from exclusion_lot
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage/cache", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage/cache", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2080,7 +2080,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 	// Test get_lots_from_dir: /data/storage/cache/subdir should NOT return exclusion_lot (excluded recursively)
 	// It should return "default" since the subdir is under a RECURSIVE exclusion
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage/cache/subdir", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage/cache/subdir", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2089,7 +2089,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// Test get_lots_from_dir: /data/storage/cache/deep/nested/path should also be excluded (recursive exclusion)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage/cache/deep/nested/path", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage/cache/deep/nested/path", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2098,7 +2098,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// Test NON-RECURSIVE exclusion: /data/storage/stuff itself should be excluded
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage/stuff", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage/stuff", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2108,7 +2108,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 	// Test NON-RECURSIVE exclusion: /data/storage/stuff/foo should be INCLUDED
 	// Because the exclusion is non-recursive, subdirs fall back to the parent inclusion /data/storage
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage/stuff/foo", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage/stuff/foo", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2118,7 +2118,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// Test NON-RECURSIVE exclusion: /data/storage/stuff/foo/bar/baz should also be INCLUDED
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/storage/stuff/foo/bar/baz", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/storage/stuff/foo/bar/baz", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2188,7 +2188,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// Test that /test/path/subdir still returns the lot (not excluded)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/test/path/subdir", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/test/path/subdir", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2197,7 +2197,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// Test that /test/path/excluded returns "default" (excluded from default_exclude_lot)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/test/path/excluded", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/test/path/excluded", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2249,7 +2249,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// /data/cache should be excluded
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/cache", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/cache", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	EXPECT_STREQ(lots_output[0], "default") << "/data/cache should be excluded";
@@ -2257,7 +2257,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// /data/cachedata should NOT be excluded (different path, just happens to have "cache" prefix)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/cachedata", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/cachedata", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	EXPECT_STREQ(lots_output[0], "prefix_test_lot") << "/data/cachedata should NOT be excluded (different path)";
@@ -2265,7 +2265,7 @@ TEST_F(LotManTest, PathExclusionTest) {
 
 	// /data/cache/subdir should be excluded (under recursive exclusion)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/cache/subdir", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/data/cache/subdir", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	EXPECT_STREQ(lots_output[0], "default") << "/data/cache/subdir should be excluded";
@@ -2325,7 +2325,7 @@ TEST_F(LotManTest, PathExclusionUpdateTest) {
 
 	// Verify get_lots_from_dir respects the update - should return "default" now
 	char **lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/update/test", false, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/update/test", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
 	ASSERT_NE(lots_output, nullptr);
@@ -2427,7 +2427,7 @@ TEST_F(LotManTest, UpdateUsageByDirWithExclusionsTest) {
 		}
 	])";
 
-	rv = lotman_update_lot_usage_by_dir(usage_update, false, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(usage_update, false, 150, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed to update usage by dir: " << err_msg.get();
 
@@ -2481,7 +2481,7 @@ TEST_F(LotManTest, UpdateUsageByDirWithExclusionsTest) {
 		}
 	])";
 
-	rv = lotman_update_lot_usage_by_dir(delta_update, true, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(delta_update, true, 150, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed delta update: " << err_msg.get();
 
@@ -2573,7 +2573,7 @@ TEST_F(LotManTest, UpdateUsageByDirNestedExclusionsTest) {
 		}
 	])";
 
-	rv = lotman_update_lot_usage_by_dir(nested_update, false, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(nested_update, false, 150, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed nested update: " << err_msg.get();
 
@@ -2723,7 +2723,7 @@ TEST_F(LotManTest, UpdateUsageByDirIncludesSubdirsWithExclusionsTest) {
 		}
 	])";
 
-	rv = lotman_update_lot_usage_by_dir(usage_update, false, &raw_err);
+	rv = lotman_update_lot_usage_by_dir(usage_update, false, 150, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed usage update: " << err_msg.get();
 

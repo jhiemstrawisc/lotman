@@ -1,6 +1,7 @@
 // #include <algorithm>
 // #include <stdio.h>
 // #include <string>
+#include <functional>
 #include <nlohmann/json.hpp>
 #include <vector>
 
@@ -168,7 +169,7 @@ class Lot {
 	void init_self_usage();
 	static std::pair<bool, std::string> lot_exists(const std::string &lot_name);
 	std::pair<bool, std::string> check_if_root();
-	std::pair<bool, std::string> store_lot();
+	std::pair<bool, std::string> store_lot(const json &parent_attributions_json = json());
 	std::pair<bool, std::string> destroy_lot();
 	std::pair<bool, std::string> destroy_lot_recursive();
 
@@ -181,7 +182,7 @@ class Lot {
 	std::pair<json, std::string> get_restricting_attribute(const std::string &key, const bool recursive);
 
 	std::pair<json, std::string> get_lot_dirs(const bool recursive);
-	static std::pair<std::string, std::string> get_lot_from_dir(const std::string &dir_path);
+	static std::pair<std::string, std::string> get_lot_from_dir(const std::string &dir_path, int64_t query_time);
 
 	std::pair<json, std::string> get_lot_usage(const std::string &key, const bool recursive);
 
@@ -204,7 +205,8 @@ class Lot {
 		const std::map<std::string, std::vector<int>> &update_str_map = std::map<std::string, std::vector<int>>(),
 		const std::map<int64_t, std::vector<int>> &update_int_map = std::map<int64_t, std::vector<int>>(),
 		const std::map<double, std::vector<int>> &update_dbl_map = std::map<double, std::vector<int>>());
-	static std::pair<bool, std::string> update_usage_by_dirs(const json &update_JSON, bool deltaMode);
+	static std::pair<bool, std::string> update_usage_by_dirs(const json &update_JSON, bool deltaMode,
+															 int64_t query_time);
 	std::pair<bool, std::string> check_context_for_parents(const std::vector<std::string> &parents,
 														   bool include_self = false, bool new_lot = false);
 	std::pair<bool, std::string> check_context_for_parents(const std::vector<Lot> &parents, bool include_self = false,
@@ -222,14 +224,79 @@ class Lot {
 																			  const bool recursive_children);
 	static std::pair<std::vector<std::string>, std::string> get_lots_past_obj(const bool recursive_quota,
 																			  const bool recursive_children);
+
+	// Hierarchical-aware overloads: when hierarchical=true, uses adjusted usage
+	// and returns depth-ordered results (deepest/leaf lots first).
+	// NOTE: When hierarchical=true, recursive_quota and recursive_children are
+	// not used — the hierarchical SQL query has its own built-in logic.
+	// They are only forwarded to the non-hierarchical path when hierarchical=false.
+	static std::pair<std::vector<std::string>, std::string>
+	get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool hierarchical);
+	static std::pair<std::vector<std::string>, std::string>
+	get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool hierarchical);
+	static std::pair<std::vector<std::string>, std::string>
+	get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool hierarchical);
+
+	// Strict hierarchy validation methods
+	static std::pair<bool, std::string> validate_axiom1(const std::string &child_lot_name);
+	static std::pair<bool, std::string> validate_axiom2_for_parents_of(const std::string &child_lot_name);
+	static std::pair<bool, std::string> validate_axiom3(const std::string &child_lot_name);
+
+	// Validation predicate: returns (success, error_message)
+	using ValidationPredicate = std::function<std::pair<bool, std::string>()>;
+
+	// Apply predicates sequentially; return first failure or (true, "")
+	static std::pair<bool, std::string> apply_validation_predicates(const std::vector<ValidationPredicate> &predicates);
+
+	// Build axiom predicates for a lot. If check_children is true, also validates
+	// each direct child against the lot. Returns empty vector if strict hierarchy is off.
+	static std::vector<ValidationPredicate> build_axiom_predicates(const std::string &lot_name,
+																   bool check_children = false);
+
+	// Attribution computation: compute how a child's MPAs are split across its parents,
+	// then store into parent_child_attributions table.
+	// parent_attributions_json is optional; missing parents get equal split of remainder.
+	std::pair<bool, std::string> compute_and_store_attributions(const json &parent_attributions_json = json());
+
+	// Update existing attributions for this lot
+	std::pair<bool, std::string> update_attributions(const json &parent_attributions_json);
+
+	// Contraction policy check for lot deletion. Returns (false, reason) if blocked.
+	static std::pair<bool, std::string> check_contraction_for_deletion(const std::string &lot_name);
+
+	// Check whether a lot is currently "alive" (creation_time <= now < expiration_time;
+	// i.e. the active interval is half-open).
+	// Returns (true, "") if alive, (false, "") if not alive, or (false, error) on failure.
+	static std::pair<bool, std::string> is_lot_alive(const std::string &lot_name);
 	static std::pair<std::vector<std::string>, std::string> list_all_lots();
 	static std::pair<std::vector<std::string>, std::string> get_lots_from_dir(const std::string &dir,
-																			  const bool recursive);
+																			  const bool recursive, int64_t query_time);
+
+	// Advisory: compute available capacity under a parent lot during a time window.
+	// Returns JSON with available and peak values for each resource type.
+	// WARNING: This is NOT the reservation mechanism. Capacity enforcement is
+	// performed atomically by validate_axiom2_for_parents_of inside the lot creation transaction.
+	// Use this method only for informational/monitoring purposes.
+	static std::pair<json, std::string> get_available_capacity(const std::string &parent_lot_name, int64_t start_time,
+															   int64_t end_time);
+
+	// Non-transactional update helpers used by the C-API dispatchers
+	// (lotman_update_lot / lotman_add_to_lot) so the entire dispatch can
+	// run inside a single outer storage.transaction(). Each *_in_txn helper
+	// performs the same work as its public counterpart (including any
+	// per-step axiom revalidation), but does NOT open its own transaction.
+	// Returns false and sets txn_error on failure to trigger rollback.
+	bool update_owner_in_txn(const std::string &update_val, std::string &txn_error);
+	bool update_parents_in_txn(const json &update_arr, std::string &txn_error);
+	bool update_paths_in_txn(const json &update_arr, std::string &txn_error);
+	bool update_man_policy_attrs_in_txn(const std::string &update_key, double update_val, std::string &txn_error);
+	bool update_attributions_in_txn(const json &parent_attributions_json, std::string &txn_error);
+	bool add_paths_in_txn(const std::vector<json> &paths, std::string &txn_error);
+	bool add_parents_in_txn(const std::vector<Lot> &parents, std::string &txn_error);
 
   private:
 	std::pair<bool, std::string> write_new();
 	std::pair<bool, std::string> delete_lot_from_db();
-	std::pair<bool, std::string> store_new_paths(const std::vector<json> &new_paths);
 	std::pair<bool, std::string> store_new_parents(const std::vector<Lot> &new_parents);
 	std::pair<bool, std::string> store_updates(
 		const std::string &update_query,
@@ -238,6 +305,22 @@ class Lot {
 		const std::map<double, std::vector<int>> &update_dbl_map = std::map<double, std::vector<int>>());
 	std::pair<bool, std::string> remove_parents_from_db(const std::vector<std::string> &parents);
 	std::pair<bool, std::string> remove_paths_from_db(const std::vector<std::string> &paths);
+
+	// Check whether a path conflicts with another lot's claim during overlapping time ranges.
+	// Caller MUST be inside an active storage.transaction().
+	static std::pair<bool, std::string> check_path_temporal_overlap(const std::string &lot_name,
+																	const std::string &normalized_path,
+																	int64_t creation_time, int64_t expiration_time);
+
+	// Non-transactional helpers for composing inside an outer transaction.
+	// Callers MUST hold an active storage.transaction().
+	bool add_parents_impl(const std::vector<Lot> &parents, std::string &txn_error);
+	bool update_parents_impl(const json &update_arr, std::string &txn_error);
+
+	// Reload parents + MPAs from DB, clear old attributions, recompute with equal split,
+	// and validate axioms. Caller MUST hold an active storage.transaction().
+	// Returns false and sets txn_error on failure.
+	bool reload_and_recompute_attributions(std::string &txn_error);
 };
 
 class DirUsageUpdate : public Lot {
@@ -246,8 +329,11 @@ class DirUsageUpdate : public Lot {
 	std::string m_current_path;
 	std::string m_parent_prefix;
 
-	DirUsageUpdate() : m_depth{0}, m_current_path{}, m_parent_prefix{} {}
-	DirUsageUpdate(int depth, std::string path) : m_depth{depth}, m_current_path{}, m_parent_prefix{path} {}
+	int64_t m_query_time;
+
+	DirUsageUpdate() : m_depth{0}, m_current_path{}, m_parent_prefix{}, m_query_time{0} {}
+	DirUsageUpdate(int depth, std::string path, int64_t query_time)
+		: m_depth{depth}, m_current_path{}, m_parent_prefix{path}, m_query_time{query_time} {}
 
 	std::pair<bool, std::string> JSON_math(json update_JSON, std::vector<Lot> *return_lots) {
 		std::map<std::string, double> size_updates;
@@ -284,7 +370,7 @@ class DirUsageUpdate : public Lot {
 			}
 
 			// Figure out which lot to associate with the dir
-			auto rp_vec_str = get_lots_from_dir(m_current_path, false);
+			auto rp_vec_str = get_lots_from_dir(m_current_path, false, m_query_time);
 			if (!rp_vec_str.second.empty()) { // There was an error
 				std::string int_err = rp_vec_str.second;
 				std::string ext_err = "Failure on call to get_lots_from_dir: ";
@@ -355,7 +441,7 @@ class DirUsageUpdate : public Lot {
 						subdir_path = m_current_path + subdir["path"].get<std::string>();
 					}
 
-					auto subdir_lot_rp = get_lots_from_dir(subdir_path, false);
+					auto subdir_lot_rp = get_lots_from_dir(subdir_path, false, m_query_time);
 					if (subdir_lot_rp.second.empty() && !subdir_lot_rp.first.empty() &&
 						subdir_lot_rp.first[0] != lot.lot_name) {
 						// Subdir belongs to a different lot (e.g., due to exclusion)
@@ -371,7 +457,7 @@ class DirUsageUpdate : public Lot {
 					for (const auto &subdir : update["subdirs"]) {
 						subtract_subdir_values(subdir);
 					}
-					DirUsageUpdate dirUpdate(m_depth + 1, m_current_path);
+					DirUsageUpdate dirUpdate(m_depth + 1, m_current_path, m_query_time);
 					dirUpdate.JSON_math(update["subdirs"], return_lots);
 				} else if (!other_lot_subdirs.empty()) {
 					// Recursive path but some subdirs are excluded - subtract only those
@@ -379,7 +465,7 @@ class DirUsageUpdate : public Lot {
 						subtract_subdir_values(subdir);
 					}
 					// Process only the subdirs that belong to other lots
-					DirUsageUpdate dirUpdate(m_depth + 1, m_current_path);
+					DirUsageUpdate dirUpdate(m_depth + 1, m_current_path, m_query_time);
 					dirUpdate.JSON_math(other_lot_subdirs, return_lots);
 				}
 				// If recursive and all subdirs belong to same lot, do nothing extra -
@@ -432,6 +518,12 @@ class DirUsageUpdate : public Lot {
 	}
 };
 
+// NOTE: Context is NOT thread-safe. All static members (m_caller, m_home,
+// m_strict_hierarchy, m_contraction_policy, m_admin_override) are accessed
+// without synchronization. Callers must ensure Context is configured from
+// a single thread before invoking LotMan operations. This is a pre-existing
+// design constraint — the PooledConnection pool handles DB-level concurrency,
+// but Context state must be set up front.
 class Context {
   public:
 	Context() {}
@@ -445,9 +537,37 @@ class Context {
 		return *m_home;
 	}
 
+	// Strict hierarchy enforcement: when true, lot creation/updates must satisfy
+	// Axioms 1-3 (child MPAs within parent bounds, aggregate children within parent,
+	// timestamp containment)
+	static void set_strict_hierarchy(bool enabled);
+	static bool get_strict_hierarchy() {
+		return m_strict_hierarchy;
+	}
+
+	// Contraction policy: controls whether lot MPA reductions (and deletions) are allowed.
+	// "none" (default): no restrictions on MPA reductions
+	// "alive": block reductions on lots where creation_time <= now <= expiration_time
+	// "always": block any MPA reduction regardless of time
+	static std::pair<bool, std::string> set_contraction_policy(const std::string &policy);
+	static std::string get_contraction_policy() {
+		return m_contraction_policy;
+	}
+
+	// Admin override: when true, bypasses contraction policy checks.
+	// The calling library is responsible for verifying the caller is a root lot owner
+	// before setting this.
+	static void set_admin_override(bool enabled);
+	static bool get_admin_override() {
+		return m_admin_override;
+	}
+
   private:
 	static std::shared_ptr<std::string> m_caller;
 	static std::shared_ptr<std::string> m_home;
+	static bool m_strict_hierarchy;
+	static std::string m_contraction_policy;
+	static bool m_admin_override;
 
 	static std::vector<std::string> path_split(const std::string dir_path);
 	static std::pair<bool, std::string> mkdir_and_parents_if_needed(const std::string dir_path);

@@ -91,9 +91,12 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg);
 		"max_num_objects": An int64 indicating the maxiximum number of objects a lot may have attributed to it.
 		"creation_time":
 			REQUIRED: A Unix timestamp in milliseconds indicating when the lot should begin its existence.
+			The lot is considered active starting at this time (inclusive). Together with expiration_time,
+			this defines a half-open interval [creation_time, expiration_time).
 		"expiration_time":
-			REQUIRED: A Unix timestamp in milliseconds indicating when the lot "expires". In a similar vein
-			as opp storage, a lot and its storage become transient after its expiration time has passed. If
+			REQUIRED: A Unix timestamp in milliseconds indicating when the lot "expires". The lot is
+			considered active up to, but not including, this time (half-open interval). In a similar vein
+			as opp storage, a lot and its storage become transient once expiration time is reached. If
 			the system determines there is unused space, the lot may continue to exist, but all storage tied
 			to the lot should be considered opportunistic.
 		"deletion_time":
@@ -213,6 +216,12 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg);
 			"deletion_time":
 				OPTIONAL: A Unix timestamp in milliseconds indicating the lot's new deletion time.
 		}
+	"parent_attributions":
+		OPTIONAL: An object specifying how each parent's allocation is attributed to this lot.
+		Wholesale-replace semantics: any parent omitted from this object receives the equal-split
+		remainder of the child's MPAs. When strict_hierarchy is enabled, Axioms 1 and 2 are
+		re-validated after the update; failure rolls back the attribution writes.
+		Form: {"parent_name": {"dedicated_GB": 2.5, "opportunistic_GB": 1.0, "max_num_objects": 10}, ...}
 }
 */
 
@@ -292,6 +301,12 @@ int lotman_add_to_lot(const char *additions_JSON_str, char **err_msg);
 	"parents":
 		OPTIONAL: An array of strings indicating the new parents to be added to the lot. These
 		parents must be existing, valid lot names.
+	"parent_attributions":
+		OPTIONAL: An object specifying how each parent's allocation is attributed to this lot.
+		Processed after `parents`, so newly added parents may appear here. Wholesale-replace
+		semantics: any parent omitted from this object receives the equal-split remainder of the
+		child's MPAs. When strict_hierarchy is enabled, Axioms 1 and 2 are re-validated.
+		Form: {"parent_name": {"dedicated_GB": 2.5, "opportunistic_GB": 1.0, "max_num_objects": 10}, ...}
 }
 */
 
@@ -580,7 +595,7 @@ int lotman_update_lot_usage(const char *update_JSON_str, bool delta_mode, char *
 }
 */
 
-int lotman_update_lot_usage_by_dir(const char *update_JSON_str, bool delta_mode, char **err_msg);
+int lotman_update_lot_usage_by_dir(const char *update_JSON_str, bool delta_mode, int64_t query_time, char **err_msg);
 /**
 	DESCRIPTION: A function for reporting lot usage metrics to LotMan by directory tree. Unlike
 		lotman_update_lot_usage, this function only takes a JSON-encoded directory tree, with no
@@ -689,7 +704,8 @@ int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_ms
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, char ***output, char **err_msg);
+int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, char ***output,
+							 const bool hierarchical, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their opportunistic storage.
 		The function can determine which lots meet this criteria either by looking at the opportunistic storage
@@ -714,11 +730,19 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 		A reference to a char ** for storing an array of lots passed their opportunistic storage quota.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
 
+	hierarchical:
+		A boolean indicating whether the query should use hierarchy-aware adjusted usage.
+		When true, a parent's usage is adjusted by adding any overage from its children
+		(usage exceeding the child's own threshold). Results are returned depth-ordered
+		(deepest/leaf lots first). When true, recursive_quota and recursive_children
+		are not used by the hierarchical query path.
+
 	err_msg:
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, char ***output, char **err_msg);
+int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, char ***output,
+							 const bool hierarchical, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their dedicated storage.
 		The function can determine which lots meet this criteria either by looking at the dedicated storage
@@ -743,11 +767,19 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 		A reference to a char ** for storing an array of lots passed their dedicated storage quota.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
 
+	hierarchical:
+		A boolean indicating whether the query should use hierarchy-aware adjusted usage.
+		When true, a parent's usage is adjusted by adding any overage from its children
+		(usage exceeding the child's own threshold). Results are returned depth-ordered
+		(deepest/leaf lots first). When true, recursive_quota and recursive_children
+		are not used by the hierarchical query path.
+
 	err_msg:
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, char ***output, char **err_msg);
+int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, char ***output,
+							 const bool hierarchical, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their object storage quota.
 		The function can determine which lots meet this criteria either by looking at the object storage quota
@@ -772,8 +804,62 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 		A reference to a char ** for storing an array of lots passed their opportunistic storage quota.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
 
+	hierarchical:
+		A boolean indicating whether the query should use hierarchy-aware adjusted usage.
+		When true, a parent's usage is adjusted by adding any overage from its children
+		(usage exceeding the child's own threshold). Results are returned depth-ordered
+		(deepest/leaf lots first). When true, recursive_quota and recursive_children
+		are not used by the hierarchical query path.
+
 	err_msg:
 		A reference to a char array that can store any error messages.
+*/
+
+int lotman_get_available_capacity(const char *parent_lot_name, int64_t start_time, int64_t end_time, char **output,
+								  char **err_msg);
+/**
+	DESCRIPTION: Compute available and peak capacity under a parent lot during a time window.
+		Sums each child's parent_attributions over the supplied window using a sweep-line
+		algorithm that accounts for overlapping active intervals, then subtracts the peak
+		concurrent usage from the parent's MPAs.
+
+		WARNING: This is an *advisory* query, not a reservation mechanism. Reservation
+		enforcement is performed atomically by Axiom 2 inside the lot-creation transaction
+		when strict_hierarchy is enabled, so another caller may legitimately claim capacity
+		between this query and the subsequent create.
+
+	RETURNS: Returns 0 on success. Any other values indicate an error.
+
+	INPUTS:
+	parent_lot_name:
+		The name of the parent lot whose capacity should be queried.
+
+	start_time:
+		Beginning of the query window, as a Unix timestamp in milliseconds (inclusive).
+
+	end_time:
+		End of the query window, as a Unix timestamp in milliseconds (exclusive). Children
+		whose active intervals overlap [start_time, end_time) are clipped to that window
+		before being summed.
+
+	output:
+		A reference to a char * for storing the result, formatted as a JSON object (see
+		specification below).
+		NOTE: The caller owns the returned string and must free() it.
+
+	err_msg:
+		A reference to a char array that can store any error messages.
+
+	Output JSON Specification:
+{   "available_dedicated_GB":     <number>,  // parent dedicated_GB minus peak concurrent attributed dedicated_GB
+	"available_opportunistic_GB": <number>,  // analogous for opportunistic_GB
+	"available_max_num_objects":  <int64>,   // analogous for max_num_objects
+	"available_total_GB":         <number>,  // (parent dedicated_GB + opportunistic_GB) minus peak (ded+opp)
+	"peak_dedicated_GB":          <number>,
+	"peak_opportunistic_GB":      <number>,
+	"peak_max_num_objects":       <int64>,
+	"peak_total_GB":              <number>   // peak (ded+opp) at any single instant in the window
+}
 */
 
 int lotman_list_all_lots(char ***output, char **err_msg);
@@ -843,7 +929,7 @@ for the 'recursive' flag. When recursive is true, each MPA will contain a JSON o
 }
 */
 
-int lotman_get_lots_from_dir(const char *dir, const bool recursive, char ***output, char **err_msg);
+int lotman_get_lots_from_dir(const char *dir, const bool recursive, int64_t query_time, char ***output, char **err_msg);
 /**
 	DESCRIPTION: A function for getting any lots associated with the supplied path. The function can
 		return either solely the lot tracking the path, or any parent lots who might also be affected
