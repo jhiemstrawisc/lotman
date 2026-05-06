@@ -964,6 +964,13 @@ for the 'recursive' flag. When recursive is true, each MPA will contain a JSON o
 		A JSON object containing each of the lot's usage metrics, as determined by accounting for the 'recursive'
 		flag. When recursive is true, each usage metric will contain a JSON object with the following format:
 		{"children_contrib": <value>,"self_contrib": <value>}
+	"parent_attributions":
+		A JSON object describing how the lot's MPAs are attributed across each non-self parent, in the same shape
+		accepted by lotman_add_lot. The form is:
+		{"<parent_name>": {"dedicated_GB": <value>, "opportunistic_GB": <value>, "max_num_objects": <int>}}
+		Values are absolute MPA shares (not fractions), so a create-then-read round-trip is symmetric. Unbounded
+		child axes (-1 sentinel) propagate to each parent as -1. For self-parent-only lots (i.e. lots with no
+		non-self parents), this field is an empty object.
 }
 */
 

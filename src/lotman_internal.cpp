@@ -831,6 +831,58 @@ std::pair<std::string, std::string> lotman::Lot::get_lot_from_dir(const std::str
 	}
 }
 
+std::pair<json, std::string> lotman::Lot::get_parent_attributions() {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		auto child_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+		if (!child_mpa) {
+			return std::make_pair(json::object(), "Lot '" + lot_name + "' has no MPAs");
+		}
+
+		auto attributions = storage.get_all<db::ParentChildAttribution>(
+			where(c(&db::ParentChildAttribution::child_lot_name) == lot_name));
+
+		json result = json::object();
+		for (const auto &attr : attributions) {
+			double child_value;
+			if (attr.mpa_key == "dedicated_GB") {
+				child_value = child_mpa->dedicated_GB;
+			} else if (attr.mpa_key == "opportunistic_GB") {
+				child_value = child_mpa->opportunistic_GB;
+			} else if (attr.mpa_key == "max_num_objects") {
+				child_value = static_cast<double>(child_mpa->max_num_objects);
+			} else {
+				continue; // unknown key; skip
+			}
+
+			// Unbounded child sentinel: fraction is stored as 1.0 and the
+			// unbounded designation propagates to every parent. Reconstruct
+			// as the -1 sentinel rather than emitting fraction * -1.
+			if (child_value == -1.0) {
+				if (attr.mpa_key == "max_num_objects") {
+					result[attr.parent_lot_name][attr.mpa_key] = static_cast<int64_t>(-1);
+				} else {
+					result[attr.parent_lot_name][attr.mpa_key] = -1.0;
+				}
+				continue;
+			}
+
+			double attributed = attr.fraction * child_value;
+			if (attr.mpa_key == "max_num_objects") {
+				result[attr.parent_lot_name][attr.mpa_key] = static_cast<int64_t>(std::llround(attributed));
+			} else {
+				result[attr.parent_lot_name][attr.mpa_key] = attributed;
+			}
+		}
+
+		return std::make_pair(result, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(json::object(), std::string("get_parent_attributions failed: ") + e.what());
+	}
+}
+
 std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, const bool recursive) {
 
 	// TODO: Introduce some notion of verbocity to give options for output, like:
