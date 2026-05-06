@@ -984,12 +984,17 @@ std::pair<bool, std::string> Lot::check_path_temporal_overlap(const std::string 
 															  const std::string &normalized_path, int64_t creation_time,
 															  int64_t expiration_time) {
 	// Single JOIN query replaces the previous N+1 pattern (one SELECT for
-	// candidate lots, plus one get_pointer per candidate).
+	// candidate lots, plus one get_pointer per candidate). The non-expiring
+	// sentinel (all timestamps = 0) is treated as an interval covering all
+	// time, so a sentinel lot on either side of the comparison always
+	// overlaps the other.
 	std::string query = "SELECT p.lot_name, mpa.creation_time, mpa.expiration_time "
 						"FROM paths p "
 						"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
 						"WHERE p.path = ?1 AND p.lot_name != ?2 AND p.exclude = 0 "
-						"AND ?3 < mpa.expiration_time AND mpa.creation_time < ?4 "
+						"AND ((mpa.creation_time = 0 AND mpa.expiration_time = 0) "
+						"     OR (?3 = 0 AND ?4 = 0) "
+						"     OR (?3 < mpa.expiration_time AND mpa.creation_time < ?4)) "
 						"LIMIT 1;";
 	std::map<std::string, std::vector<int>> str_map{{normalized_path, {1}}, {lot_name, {2}}};
 	std::map<int64_t, std::vector<int>> int_map{{creation_time, {3}}, {expiration_time, {4}}};

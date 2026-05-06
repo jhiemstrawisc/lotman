@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <sys/stat.h>
@@ -83,8 +84,15 @@ std::vector<SweepEvent> build_attribution_events(const std::string &parent_lot_n
 		if (!child_mpa)
 			continue;
 
+		// Non-expiring children (sentinel: all timestamps are 0) are treated
+		// as if they span (-infinity, +infinity), so they are always present
+		// during any query window.
+		const bool child_non_expiring =
+			is_non_expiring(child_mpa->creation_time, child_mpa->expiration_time, child_mpa->deletion_time);
+
 		// If window specified, skip children that don't overlap it
-		if (has_window && (child_mpa->creation_time >= end_time || child_mpa->expiration_time <= start_time))
+		if (!child_non_expiring && has_window &&
+			(child_mpa->creation_time >= end_time || child_mpa->expiration_time <= start_time))
 			continue;
 
 		// Get attributions from this parent to this child
@@ -114,8 +122,8 @@ std::vector<SweepEvent> build_attribution_events(const std::string &parent_lot_n
 							  : 0.0;
 
 		// Determine event times: use child's full interval or clip to window
-		int64_t event_start = child_mpa->creation_time;
-		int64_t event_end = child_mpa->expiration_time;
+		int64_t event_start = child_non_expiring ? std::numeric_limits<int64_t>::min() : child_mpa->creation_time;
+		int64_t event_end = child_non_expiring ? std::numeric_limits<int64_t>::max() : child_mpa->expiration_time;
 		if (has_window) {
 			event_start = std::max(event_start, start_time);
 			event_end = std::min(event_end, end_time);
@@ -155,10 +163,12 @@ std::pair<bool, std::string> lotman::Lot::init_full(json lot_JSON) {
 	man_policy_attr.expiration_time = lot_JSON["management_policy_attrs"]["expiration_time"];
 	man_policy_attr.deletion_time = lot_JSON["management_policy_attrs"]["deletion_time"];
 
-	// Half-open interval [creation_time, expiration_time) must be non-empty
-	if (man_policy_attr.creation_time >= man_policy_attr.expiration_time) {
-		return std::make_pair(false, "creation_time must be strictly less than expiration_time (half-open interval "
-									 "[creation, expiration) must be non-empty)");
+	// Validate timestamp invariants. The all-zero tuple is a sentinel for a
+	// non-expiring lot; otherwise creation_time < expiration_time is required.
+	auto time_rp = validate_time_invariants(man_policy_attr.creation_time, man_policy_attr.expiration_time,
+											man_policy_attr.deletion_time);
+	if (!time_rp.first) {
+		return time_rp;
 	}
 
 	usage.self_GB = 0;
@@ -1604,9 +1614,15 @@ bool lotman::Lot::update_man_policy_attrs_in_txn(const std::string &update_key, 
 		return false;
 	}
 
-	// After updating a timestamp, verify half-open interval invariant
+	// After a timestamp update, verify the half-open interval invariant for
+	// non-sentinel lots. We deliberately allow an intermediate state where one
+	// or two of the three time fields are zero (the non-expiring sentinel is
+	// all-or-nothing), because a single update_lot call may set all three
+	// fields one at a time inside the same transaction. The final post-loop
+	// check in lotman_update_lot rejects any persisting partial-zero state.
 	if (update_key == "creation_time" || update_key == "expiration_time") {
-		if (mpa.creation_time >= mpa.expiration_time) {
+		bool any_zero = (mpa.creation_time == 0) || (mpa.expiration_time == 0) || (mpa.deletion_time == 0);
+		if (!any_zero && mpa.creation_time >= mpa.expiration_time) {
 			txn_error = "Update would make creation_time >= expiration_time on lot '" + lot_name +
 						"' (half-open interval [creation, expiration) must be non-empty)";
 			return false;
@@ -2099,7 +2115,8 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(
 	auto now = std::chrono::system_clock::now();
 	int64_t ms_since_epoch = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
 
-	std::string expired_query = "SELECT lot_name FROM management_policy_attributes WHERE expiration_time <= ?;";
+	std::string expired_query =
+		"SELECT lot_name FROM management_policy_attributes WHERE expiration_time != 0 AND expiration_time <= ?;";
 	std::map<int64_t, std::vector<int>> expired_map{{ms_since_epoch, {1}}};
 	auto rp = lotman::db::SQL_get_matches(expired_query, std::map<std::string, std::vector<int>>(), expired_map);
 	if (!rp.second.empty()) { // There was an error
@@ -2140,7 +2157,8 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_del(
 	auto now = std::chrono::system_clock::now();
 	int64_t ms_since_epoch = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
 
-	std::string deletion_query = "SELECT lot_name FROM management_policy_attributes WHERE deletion_time <= ?;";
+	std::string deletion_query =
+		"SELECT lot_name FROM management_policy_attributes WHERE deletion_time != 0 AND deletion_time <= ?;";
 	std::map<int64_t, std::vector<int>> deletion_map{{ms_since_epoch, {1}}};
 	auto rp = lotman::db::SQL_get_matches(deletion_query, std::map<std::string, std::vector<int>>(), deletion_map);
 	if (!rp.second.empty()) { // There was an error
@@ -2579,10 +2597,12 @@ lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursiv
 		"AND "
 		"(p.recursive OR p.path = ?3) " // If not recursive, only match exact path
 		"AND "
-		"p.exclude = 0 "				// Only consider inclusion paths
-		"AND mpa.creation_time <= ?4 "	// Lot must have started
-		"AND mpa.expiration_time > ?4 " // Lot must not have expired
-		"AND NOT EXISTS ( "				// Ensure no longer exclusion overrides this inclusion
+		"p.exclude = 0 " // Only consider inclusion paths
+		// Lot must be active during the query window. Treat the all-zero
+		// timestamp triple as the non-expiring sentinel.
+		"AND ((mpa.creation_time = 0 AND mpa.expiration_time = 0 AND mpa.deletion_time = 0) "
+		"     OR (mpa.creation_time <= ?4 AND mpa.expiration_time > ?4)) "
+		"AND NOT EXISTS ( " // Ensure no longer exclusion overrides this inclusion
 		"    SELECT 1 FROM paths e "
 		"    WHERE e.lot_name = p.lot_name "			  // Same lot
 		"    AND e.exclude = 1 "						  // Is an exclusion
@@ -3014,6 +3034,10 @@ std::pair<bool, std::string> lotman::Lot::is_lot_alive(const std::string &lot_na
 		if (!mpa) {
 			return std::make_pair(false, "");
 		}
+		// A non-expiring lot (all-zero timestamp sentinel) is always alive.
+		if (is_non_expiring(mpa->creation_time, mpa->expiration_time, mpa->deletion_time)) {
+			return std::make_pair(true, "");
+		}
 		auto now =
 			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
 				.count();
@@ -3265,6 +3289,18 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom3(const std::string &chi
 	// child.creation_time ≥ parent.creation_time
 	// child.expiration_time ≤ parent.expiration_time
 	// child.deletion_time ≤ parent.deletion_time
+	//
+	// Sentinel handling: a lot whose creation/expiration/deletion timestamps
+	// are all zero is treated as "non-expiring" (effectively spans
+	// [-infinity, +infinity)). Therefore:
+	//   * If the parent is non-expiring, any child window fits inside it and
+	//     all per-parent containment checks are skipped.
+	//   * If the child is non-expiring, every parent must also be non-expiring;
+	//     otherwise the child's infinite window cannot fit inside the parent's
+	//     finite window.
+	//   * If the child is in an intermediate "partial-zero" state (mid-update
+	//     within a transaction), defer; the final post-update invariant check
+	//     in lotman_update_lot will reject any persisting partial-zero state.
 	try {
 		auto &storage = db::StorageManager::get_storage();
 		using namespace sqlite_orm;
@@ -3272,6 +3308,17 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom3(const std::string &chi
 		auto child_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(child_lot_name);
 		if (!child_mpa) {
 			return std::make_pair(false, "Child lot '" + child_lot_name + "' not found");
+		}
+
+		const bool child_non_expiring =
+			is_non_expiring(child_mpa->creation_time, child_mpa->expiration_time, child_mpa->deletion_time);
+		const bool child_partial_zero =
+			!child_non_expiring &&
+			((child_mpa->creation_time == 0) || (child_mpa->expiration_time == 0) || (child_mpa->deletion_time == 0));
+		if (child_partial_zero) {
+			// Intermediate state during a multi-step update; defer to the
+			// post-loop invariant check in lotman_update_lot.
+			return std::make_pair(true, "");
 		}
 
 		auto parent_records = storage.select(&db::Parent::parent, where(c(&db::Parent::lot_name) == child_lot_name));
@@ -3283,6 +3330,34 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom3(const std::string &chi
 			auto parent_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(parent_name);
 			if (!parent_mpa) {
 				return std::make_pair(false, "Parent lot '" + parent_name + "' not found");
+			}
+
+			const bool parent_non_expiring =
+				is_non_expiring(parent_mpa->creation_time, parent_mpa->expiration_time, parent_mpa->deletion_time);
+			const bool parent_partial_zero =
+				!parent_non_expiring && ((parent_mpa->creation_time == 0) || (parent_mpa->expiration_time == 0) ||
+										 (parent_mpa->deletion_time == 0));
+			// Defer if the parent is in a transient partial-zero state mid-update.
+			if (parent_partial_zero) {
+				continue;
+			}
+
+			// Non-expiring parent absorbs any child window (including a
+			// non-expiring child). Skip the per-parent containment checks.
+			if (parent_non_expiring) {
+				continue;
+			}
+
+			// A non-expiring child requires every parent to also be
+			// non-expiring; the previous check already handled that case so
+			// reaching this point with a non-expiring child means a finite
+			// parent was found and the child cannot fit inside it.
+			if (child_non_expiring) {
+				return std::make_pair(
+					false, "Hierarchy violation: child lot '" + child_lot_name +
+							   "' is configured as non-expiring (all timestamps are 0) but parent lot '" + parent_name +
+							   "' has a finite time window. A non-expiring child requires every parent to also be "
+							   "non-expiring.");
 			}
 
 			if (child_mpa->creation_time < parent_mpa->creation_time) {

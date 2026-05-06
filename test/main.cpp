@@ -223,8 +223,8 @@ class LotManTest : public ::testing::Test {
 				"opportunistic_GB": 2.1,
 				"max_num_objects": 10,
 				"creation_time": 123,
-				"expiration_time": 99679525853643,
-				"deletion_time": 9267952553643
+				"expiration_time": 9267952553643,
+				"deletion_time": 99679525853643
 			}
 		})";
 		addLot(sep_node);
