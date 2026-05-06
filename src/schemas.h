@@ -230,6 +230,12 @@ inline json lot_update_schema = []() {
                     "minimum": 0,
                     "multipleOf": 1
                 },
+                "creation_time": {
+                    "description": "Creation time of the lot, in ms since Unix epoch. A value of 0 (with expiration_time and deletion_time also 0) marks the lot as non-expiring.",
+                    "type": "number",
+                    "minimum": 0,
+                    "multipleOf": 1
+                },
                 "expiration_time": {
                     "description": "Expiration time of the lot, in ms since Unix epoch",
                     "type": "number",

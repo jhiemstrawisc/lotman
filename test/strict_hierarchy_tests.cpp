@@ -6015,4 +6015,413 @@ TEST_F(StrictHierarchyTest, UpdateLotIsAtomicAcrossSubOperations) {
 	EXPECT_DOUBLE_EQ(parent_json["management_policy_attrs"]["dedicated_GB"].get<double>(), 100.0);
 }
 
+// ============================================================================
+// Non-expiring lot sentinel: a creation/expiration/deletion triple of all
+// zeros marks a lot as never-expiring. The sentinel is all-or-nothing.
+// ============================================================================
+
+namespace {
+// Helper: read the timestamps for a stored lot via lotman_get_lot_as_json.
+struct LotTimes {
+	int64_t creation_time;
+	int64_t expiration_time;
+	int64_t deletion_time;
+};
+
+LotTimes get_lot_times(const std::string &lot_name) {
+	char *raw_out = nullptr;
+	char *raw_err = nullptr;
+	int rv = lotman_get_lot_as_json(lot_name.c_str(), false, &raw_out, &raw_err);
+	UniqueCString out(raw_out);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << (err.get() ? err.get() : "");
+	auto j = json::parse(out.get());
+	return LotTimes{j["management_policy_attrs"]["creation_time"].get<int64_t>(),
+					j["management_policy_attrs"]["expiration_time"].get<int64_t>(),
+					j["management_policy_attrs"]["deletion_time"].get<int64_t>()};
+}
+
+const char *kNonExpiringRoot = R"({
+	"lot_name": "ne_root",
+	"owner": "owner1",
+	"parents": ["ne_root"],
+	"paths": [{"path": "/ne/root", "recursive": true}],
+	"management_policy_attrs": {
+		"dedicated_GB": 100,
+		"opportunistic_GB": 50,
+		"max_num_objects": 1000,
+		"creation_time": 0,
+		"expiration_time": 0,
+		"deletion_time": 0
+	}
+})";
+} // namespace
+
+TEST_F(StrictHierarchyTest, AddNonExpiringRootLotSucceeds) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(kNonExpiringRoot, &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
+
+	auto t = get_lot_times("ne_root");
+	EXPECT_EQ(t.creation_time, 0);
+	EXPECT_EQ(t.expiration_time, 0);
+	EXPECT_EQ(t.deletion_time, 0);
+}
+
+TEST_F(StrictHierarchyTest, AddLotRejectsPartialZeroTimestamps) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+
+	// creation_time = 0 with non-zero expiration/deletion -> rejected.
+	int rv = lotman_add_lot(R"({
+		"lot_name": "partial_zero_a", "owner": "owner1", "parents": ["partial_zero_a"],
+		"paths": [{"path": "/pz/a", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1, "opportunistic_GB": 0, "max_num_objects": 1,
+			"creation_time": 0, "expiration_time": 100, "deletion_time": 200}})",
+							&raw_err);
+	UniqueCString err1(raw_err);
+	EXPECT_NE(rv, 0) << "Mixing zero and non-zero timestamps must be rejected";
+	ASSERT_NE(err1.get(), nullptr);
+	EXPECT_NE(std::string(err1.get()).find("non-expiring"), std::string::npos)
+		<< "Error message should mention the non-expiring sentinel; got: " << err1.get();
+
+	// Only expiration_time = 0 -> rejected.
+	raw_err = nullptr;
+	rv = lotman_add_lot(R"({
+		"lot_name": "partial_zero_b", "owner": "owner1", "parents": ["partial_zero_b"],
+		"paths": [{"path": "/pz/b", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1, "opportunistic_GB": 0, "max_num_objects": 1,
+			"creation_time": 100, "expiration_time": 0, "deletion_time": 200}})",
+						&raw_err);
+	UniqueCString err2(raw_err);
+	EXPECT_NE(rv, 0) << "Mixing zero and non-zero timestamps must be rejected";
+
+	// Only deletion_time = 0 -> rejected.
+	raw_err = nullptr;
+	rv = lotman_add_lot(R"({
+		"lot_name": "partial_zero_c", "owner": "owner1", "parents": ["partial_zero_c"],
+		"paths": [{"path": "/pz/c", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1, "opportunistic_GB": 0, "max_num_objects": 1,
+			"creation_time": 100, "expiration_time": 200, "deletion_time": 0}})",
+						&raw_err);
+	UniqueCString err3(raw_err);
+	EXPECT_NE(rv, 0) << "Mixing zero and non-zero timestamps must be rejected";
+
+	// None of the rejected lots should have been persisted.
+	raw_err = nullptr;
+	EXPECT_EQ(lotman_lot_exists("partial_zero_a", &raw_err), 0);
+	free(raw_err);
+	raw_err = nullptr;
+	EXPECT_EQ(lotman_lot_exists("partial_zero_b", &raw_err), 0);
+	free(raw_err);
+	raw_err = nullptr;
+	EXPECT_EQ(lotman_lot_exists("partial_zero_c", &raw_err), 0);
+	free(raw_err);
+}
+
+TEST_F(StrictHierarchyTest, NonExpiringChildAllowedUnderNonExpiringParentStrict) {
+	// Strict-hierarchy mode: the non-expiring parent's "infinite" window
+	// absorbs the non-expiring child, and Axiom 3 must accept the child.
+	addDefaultLot();
+	char *raw_err = nullptr;
+	ASSERT_EQ(lotman_add_lot(kNonExpiringRoot, &raw_err), 0);
+	free(raw_err);
+
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
+
+	rv = lotman_add_lot(R"({
+		"lot_name": "ne_child",
+		"owner": "owner1",
+		"parents": ["ne_root"],
+		"paths": [{"path": "/ne/child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10, "opportunistic_GB": 5, "max_num_objects": 100,
+			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_EQ(rv, 0) << "Non-expiring child under non-expiring parent must be allowed: "
+					 << (err.get() ? err.get() : "");
+}
+
+TEST_F(StrictHierarchyTest, FiniteChildAllowedUnderNonExpiringParentStrict) {
+	// Strict-hierarchy mode: a non-expiring parent absorbs any finite child
+	// window because the parent's window is effectively (-inf, +inf).
+	addDefaultLot();
+	char *raw_err = nullptr;
+	ASSERT_EQ(lotman_add_lot(kNonExpiringRoot, &raw_err), 0);
+	free(raw_err);
+
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
+
+	rv = lotman_add_lot(R"({
+		"lot_name": "finite_under_ne",
+		"owner": "owner1",
+		"parents": ["ne_root"],
+		"paths": [{"path": "/ne/finite", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10, "opportunistic_GB": 5, "max_num_objects": 100,
+			"creation_time": 1, "expiration_time": 999999999, "deletion_time": 999999999
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_EQ(rv, 0) << "Finite child under non-expiring parent must be allowed: " << (err.get() ? err.get() : "");
+}
+
+TEST_F(StrictHierarchyTest, NonExpiringChildRejectedUnderFiniteParentStrict) {
+	// Strict-hierarchy mode: a non-expiring child cannot fit inside a finite
+	// parent window, so Axiom 3 must reject the child.
+	addDefaultLot();
+	char *raw_err = nullptr;
+
+	addLot(R"({
+		"lot_name": "finite_parent",
+		"owner": "owner1",
+		"parents": ["finite_parent"],
+		"paths": [{"path": "/finite/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100, "opportunistic_GB": 50, "max_num_objects": 1000,
+			"creation_time": 100, "expiration_time": 9000, "deletion_time": 9500
+		}
+	})");
+
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
+
+	rv = lotman_add_lot(R"({
+		"lot_name": "ne_under_finite",
+		"owner": "owner1",
+		"parents": ["finite_parent"],
+		"paths": [{"path": "/finite/ne_child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10, "opportunistic_GB": 5, "max_num_objects": 50,
+			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_NE(rv, 0) << "Non-expiring child under finite parent must be rejected";
+	ASSERT_NE(err.get(), nullptr);
+	EXPECT_NE(std::string(err.get()).find("non-expiring"), std::string::npos)
+		<< "Error should mention non-expiring; got: " << err.get();
+
+	// Confirm child wasn't persisted.
+	raw_err = nullptr;
+	EXPECT_EQ(lotman_lot_exists("ne_under_finite", &raw_err), 0);
+	free(raw_err);
+}
+
+TEST_F(StrictHierarchyTest, NonExpiringLotIsAlwaysAlive) {
+	// is_lot_alive (used by the "alive" contraction policy) must treat a
+	// non-expiring lot as alive even though now > 0.
+	addDefaultLot();
+	char *raw_err = nullptr;
+	ASSERT_EQ(lotman_add_lot(kNonExpiringRoot, &raw_err), 0);
+	free(raw_err);
+
+	// Set contraction_policy=alive and try to deletion-shrink the lot's
+	// dedicated_GB; if the lot were treated as not-alive, the contraction
+	// would be permitted. We expect rejection.
+	ASSERT_EQ(lotman_set_context_str("contraction_policy", "alive", &raw_err), 0);
+	free(raw_err);
+	raw_err = nullptr;
+
+	int rv = lotman_update_lot(R"({
+		"lot_name": "ne_root",
+		"management_policy_attrs": {"dedicated_GB": 1}
+	})",
+							   &raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_NE(rv, 0) << "Non-expiring lot must be considered alive and contraction must be blocked";
+}
+
+TEST_F(StrictHierarchyTest, NonExpiringLotNotReturnedFromPastExpQuery) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	ASSERT_EQ(lotman_add_lot(kNonExpiringRoot, &raw_err), 0);
+	free(raw_err);
+
+	// Default lot in this fixture has expiration_time=9999, which is far in
+	// the past relative to "now"; it should be returned. ne_root must NOT.
+	char **raw_lots = nullptr;
+	raw_err = nullptr;
+	int rv = lotman_get_lots_past_exp(/*recursive=*/false, &raw_lots, &raw_err);
+	UniqueStringList lots(raw_lots);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
+	bool found_default = false;
+	bool found_ne_root = false;
+	for (int i = 0; lots.get()[i]; ++i) {
+		if (std::string(lots.get()[i]) == "default")
+			found_default = true;
+		if (std::string(lots.get()[i]) == "ne_root")
+			found_ne_root = true;
+	}
+	EXPECT_TRUE(found_default);
+	EXPECT_FALSE(found_ne_root) << "Non-expiring lots must never appear in past-expiration queries";
+
+	// Same expectation for past-deletion.
+	raw_lots = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lots_past_del(/*recursive=*/false, &raw_lots, &raw_err);
+	UniqueStringList del_lots(raw_lots);
+	UniqueCString del_err(raw_err);
+	ASSERT_EQ(rv, 0) << (del_err.get() ? del_err.get() : "");
+	bool found_ne_in_del = false;
+	for (int i = 0; del_lots.get()[i]; ++i) {
+		if (std::string(del_lots.get()[i]) == "ne_root")
+			found_ne_in_del = true;
+	}
+	EXPECT_FALSE(found_ne_in_del) << "Non-expiring lots must never appear in past-deletion queries";
+}
+
+TEST_F(StrictHierarchyTest, UpdateLotToNonExpiringIsAtomic) {
+	// Flipping a finite lot to the non-expiring sentinel by updating all
+	// three timestamps in a single envelope must succeed; per-field
+	// validators tolerate the transient partial-zero state inside the
+	// transaction so the caller can perform the transition atomically.
+	addDefaultLot();
+	char *raw_err = nullptr;
+	ASSERT_EQ(lotman_add_lot(kNonExpiringRoot, &raw_err), 0);
+	free(raw_err);
+	raw_err = nullptr;
+
+	addLot(R"({
+		"lot_name": "transitions",
+		"owner": "owner1",
+		"parents": ["ne_root"],
+		"paths": [{"path": "/ne/transitions", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10, "opportunistic_GB": 5, "max_num_objects": 100,
+			"creation_time": 1, "expiration_time": 1000, "deletion_time": 1500
+		}
+	})");
+
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
+
+	// Atomic flip to non-expiring.
+	rv = lotman_update_lot(R"({
+		"lot_name": "transitions",
+		"management_policy_attrs": {
+			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
+		}
+	})",
+						   &raw_err);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << "Atomic flip to non-expiring must succeed: " << (err.get() ? err.get() : "");
+	auto t = get_lot_times("transitions");
+	EXPECT_EQ(t.creation_time, 0);
+	EXPECT_EQ(t.expiration_time, 0);
+	EXPECT_EQ(t.deletion_time, 0);
+
+	// And back: atomic flip from non-expiring to finite.
+	raw_err = nullptr;
+	rv = lotman_update_lot(R"({
+		"lot_name": "transitions",
+		"management_policy_attrs": {
+			"creation_time": 2, "expiration_time": 2000, "deletion_time": 2500
+		}
+	})",
+						   &raw_err);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << "Atomic flip back to finite must succeed: " << (err.get() ? err.get() : "");
+	t = get_lot_times("transitions");
+	EXPECT_EQ(t.creation_time, 2);
+	EXPECT_EQ(t.expiration_time, 2000);
+	EXPECT_EQ(t.deletion_time, 2500);
+}
+
+TEST_F(StrictHierarchyTest, UpdateLotPartialZeroEndStateRejectedAndRolledBack) {
+	// If an update envelope ends with a partial-zero timestamp triple, the
+	// post-loop sentinel check must reject it and roll back the entire
+	// envelope (no per-field write may persist).
+	addDefaultLot();
+	char *raw_err = nullptr;
+
+	addLot(R"({
+		"lot_name": "pz_lot",
+		"owner": "owner1",
+		"parents": ["pz_lot"],
+		"paths": [{"path": "/pz/lot", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10, "opportunistic_GB": 5, "max_num_objects": 100,
+			"creation_time": 100, "expiration_time": 1000, "deletion_time": 1500
+		}
+	})");
+
+	// Attempt to set only creation_time and expiration_time to 0 while
+	// leaving deletion_time non-zero -> must be rejected.
+	int rv = lotman_update_lot(R"({
+		"lot_name": "pz_lot",
+		"management_policy_attrs": {
+			"creation_time": 0, "expiration_time": 0
+		}
+	})",
+							   &raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_NE(rv, 0) << "Partial-zero end state must be rejected";
+
+	// Original timestamps must be intact (full rollback).
+	auto t = get_lot_times("pz_lot");
+	EXPECT_EQ(t.creation_time, 100);
+	EXPECT_EQ(t.expiration_time, 1000);
+	EXPECT_EQ(t.deletion_time, 1500);
+}
+
+TEST_F(StrictHierarchyTest, NonExpiringLotPathOverlapsAnyOtherLot) {
+	// Two non-expiring lots may not claim the same path, and a non-expiring
+	// lot must conflict with a finite lot claiming the same path because
+	// the non-expiring window is treated as covering all time.
+	addDefaultLot();
+	char *raw_err = nullptr;
+	ASSERT_EQ(lotman_add_lot(kNonExpiringRoot, &raw_err), 0);
+	free(raw_err);
+
+	// Another non-expiring lot claiming the same path -> reject.
+	raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "ne_root_dup",
+		"owner": "owner1",
+		"parents": ["ne_root_dup"],
+		"paths": [{"path": "/ne/root", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1, "opportunistic_GB": 0, "max_num_objects": 1,
+			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_NE(rv, 0) << "Two non-expiring lots claiming the same path must conflict";
+
+	// A finite lot claiming the same path -> reject (sentinel covers all time).
+	raw_err = nullptr;
+	rv = lotman_add_lot(R"({
+		"lot_name": "finite_dup",
+		"owner": "owner1",
+		"parents": ["finite_dup"],
+		"paths": [{"path": "/ne/root", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1, "opportunistic_GB": 0, "max_num_objects": 1,
+			"creation_time": 100, "expiration_time": 200, "deletion_time": 300
+		}
+	})",
+						&raw_err);
+	UniqueCString err2(raw_err);
+	EXPECT_NE(rv, 0) << "Finite lot must conflict with a non-expiring lot on the same path";
+}
+
 } // namespace

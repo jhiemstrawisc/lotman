@@ -1,8 +1,11 @@
 // #include <algorithm>
 // #include <stdio.h>
 // #include <string>
+#include <cstdint>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace lotman {
@@ -35,6 +38,45 @@ class Context;
  */
 
 using json = nlohmann::json;
+
+// Sentinel: a lot whose creation_time, expiration_time, and deletion_time are
+// all zero is treated as "non-expiring". This sentinel is all-or-nothing --
+// any mix of zero and non-zero timestamps on a single lot is an error.
+inline bool is_non_expiring(int64_t creation_time, int64_t expiration_time, int64_t deletion_time) {
+	return creation_time == 0 && expiration_time == 0 && deletion_time == 0;
+}
+
+// Validate the time-field invariants for a lot's MPAs. Enforces:
+//   * If any of creation_time/expiration_time/deletion_time is 0, all three
+//     must be 0 (non-expiring sentinel).
+//   * Otherwise, creation_time must be strictly less than expiration_time
+//     (the active interval [creation_time, expiration_time) must be non-empty).
+// Returns (true, "") when valid, otherwise (false, message).
+inline std::pair<bool, std::string> validate_time_invariants(int64_t creation_time, int64_t expiration_time,
+															 int64_t deletion_time) {
+	bool any_zero = (creation_time == 0) || (expiration_time == 0) || (deletion_time == 0);
+	bool all_zero = is_non_expiring(creation_time, expiration_time, deletion_time);
+	if (any_zero && !all_zero) {
+		return std::make_pair(false, std::string("A lot using 0 (the unix epoch) as a timestamp sentinel for "
+												 "non-expiring lots must use 0 for all of creation_time, "
+												 "expiration_time, and deletion_time. Got creation_time=") +
+										 std::to_string(creation_time) +
+										 ", expiration_time=" + std::to_string(expiration_time) +
+										 ", deletion_time=" + std::to_string(deletion_time) + ".");
+	}
+	if (all_zero) {
+		return std::make_pair(true, "");
+	}
+	if (creation_time >= expiration_time) {
+		return std::make_pair(false, "creation_time must be strictly less than expiration_time (half-open interval "
+									 "[creation, expiration) must be non-empty)");
+	}
+	if (deletion_time < expiration_time) {
+		return std::make_pair(false, "deletion_time must be greater than or equal to expiration_time (a lot cannot "
+									 "be deleted before it expires)");
+	}
+	return std::make_pair(true, "");
+}
 
 // std::vector<std::string> get_lname_str_vec(std::vector<Lot> lot_vec) {
 //     std::vector<std::string> str_vec(lot_vec.size());

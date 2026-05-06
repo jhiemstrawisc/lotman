@@ -101,6 +101,17 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg);
 			to the lot should be considered opportunistic.
 		"deletion_time":
 			REQUIRED: A Unix timestamp in milliseconds indicating when the lot and its contents should be deleted.
+
+			Sentinel for non-expiring lots: a value of 0 (the Unix epoch) for ANY of creation_time,
+			expiration_time, or deletion_time is treated as a sentinel indicating that the lot is
+			non-expiring. The sentinel is all-or-nothing: if any of these three timestamps is 0, then
+			ALL THREE must be 0. Any mix of 0 and non-zero values is rejected so the database cannot
+			be left in an inconsistent state. Non-expiring lots never appear in expired/deletion-time
+			queries, are always considered alive, and (under strict_hierarchy) a non-expiring parent
+			accepts children with any timestamps (finite or non-expiring). The one directional
+			constraint is on non-expiring *children*: a lot with all-zero timestamps may only be
+			placed under a parent that is also non-expiring, because an infinite window cannot fit
+			inside a finite one.
 	}
 }
 */
