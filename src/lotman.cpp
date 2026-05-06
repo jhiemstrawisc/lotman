@@ -637,6 +637,14 @@ int lotman_add_to_lot(const char *lotman_JSON_str, char **err_msg) {
 		auto &storage = lotman::db::StorageManager::get_storage();
 		std::string txn_error;
 		bool committed = storage.transaction([&]() -> bool {
+			// If the caller supplied parent_attributions, route the JSON through
+			// the parent-add flow so the post-add equal-split / axiom validation
+			// uses the explicit shares rather than auto-dividing the lot's MPAs
+			// across all (existing + newly-added) parents and rejecting the
+			// auto-split before the explicit shares can take effect.
+			const json explicit_attrs =
+				addition_obj.contains("parent_attributions") ? addition_obj["parent_attributions"] : json();
+
 			if (addition_obj.contains("parents")) {
 				std::vector<lotman::Lot> parent_lots;
 				for (const auto &parent_name : addition_obj["parents"]) {
@@ -644,7 +652,7 @@ int lotman_add_to_lot(const char *lotman_JSON_str, char **err_msg) {
 					parent_lots.push_back(parent_lot);
 				}
 
-				if (!lot.add_parents_in_txn(parent_lots, txn_error)) {
+				if (!lot.add_parents_in_txn(parent_lots, txn_error, explicit_attrs)) {
 					txn_error = "Failure to add parents: " + txn_error;
 					return false;
 				}
@@ -657,9 +665,12 @@ int lotman_add_to_lot(const char *lotman_JSON_str, char **err_msg) {
 				}
 			}
 
-			// `parent_attributions` runs last so any parents added above are visible
-			// when attributions are recomputed.
-			if (addition_obj.contains("parent_attributions")) {
+			// If parent_attributions was supplied alongside `parents`, the
+			// attributions were already applied inside add_parents_in_txn above
+			// using the merged parent set. Only re-run when no `parents` were
+			// added (i.e. caller is just rewriting attributions on the existing
+			// parent set).
+			if (addition_obj.contains("parent_attributions") && !addition_obj.contains("parents")) {
 				if (!lot.update_attributions_in_txn(addition_obj["parent_attributions"], txn_error)) {
 					txn_error = "Failure to update parent attributions: " + txn_error;
 					return false;

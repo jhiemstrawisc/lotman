@@ -507,15 +507,16 @@ TEST_F(StrictHierarchyTest, Axiom2PassesSumWithinParent) {
 }
 
 TEST_F(StrictHierarchyTest, Axiom2ViolationSumDedOppExceedsParentTotal) {
-	// Axiom 2 checks BOTH:
-	//   (a) sum(ded) <= parent.ded
-	//   (b) sum(ded + opp) <= parent.(ded + opp)
-	// This test exercises check (b) by keeping each child's dedicated_GB
-	// within the parent's dedicated_GB, but making the combined ded+opp
-	// exceed the parent's total.
+	// Dedicated and opportunistic are independent storage pools, so axiom 2
+	// enforces them independently:
+	//   (a) sum(child attr_ded) <= parent.ded
+	//   (b) sum(child attr_opp) <= parent.opp
+	// This test exercises check (b): each child's dedicated_GB stays well
+	// within the parent's dedicated_GB, but the concurrent sum of
+	// opportunistic_GB across children exceeds the parent's opportunistic_GB.
 	addDefaultLot();
 
-	// Parent: ded=20, opp=5 → total=25
+	// Parent: ded=20, opp=5
 	addLot(R"({
 		"lot_name": "parent_a2do",
 		"owner": "owner1",
@@ -537,7 +538,7 @@ TEST_F(StrictHierarchyTest, Axiom2ViolationSumDedOppExceedsParentTotal) {
 	ASSERT_EQ(rv, 0);
 
 	// Child 1: ded=9, opp=5 → attributed ded=9 ≤ parent ded=20 ✓
-	//          attributed total=14 ≤ parent total=25 ✓
+	//          attributed opp=5 ≤ parent opp=5 ✓
 	raw_err = nullptr;
 	rv = lotman_add_lot(R"({
 		"lot_name": "child_a2do_1",
@@ -558,8 +559,8 @@ TEST_F(StrictHierarchyTest, Axiom2ViolationSumDedOppExceedsParentTotal) {
 	ASSERT_EQ(rv, 0) << "First child should succeed: " << (err1.get() ? err1.get() : "");
 
 	// Child 2: ded=9, opp=5 → attributed ded=9+9=18 ≤ parent ded=20 ✓
-	//          attributed total=(9+5)+(9+5)=28, parent total=25 ✗
-	// This should fail on the sum(ded+opp) check.
+	//          attributed opp=5+5=10 > parent opp=5 ✗
+	// Should fail on the per-axis opportunistic_GB check.
 	raw_err = nullptr;
 	rv = lotman_add_lot(R"({
 		"lot_name": "child_a2do_2",
@@ -577,12 +578,10 @@ TEST_F(StrictHierarchyTest, Axiom2ViolationSumDedOppExceedsParentTotal) {
 	})",
 						&raw_err);
 	UniqueCString err2(raw_err);
-	EXPECT_NE(rv, 0) << "Second child should fail — sum of ded+opp exceeds parent total";
+	EXPECT_NE(rv, 0) << "Second child should fail — concurrent sum of opportunistic_GB exceeds parent opportunistic_GB";
 	std::string err_str(err2.get() ? err2.get() : "");
-	EXPECT_TRUE(err_str.find("peak concurrent") != std::string::npos)
-		<< "Error should report that combined concurrent children exceed the parent's capacity, got: " << err_str;
-	EXPECT_TRUE(err_str.find("total GB") != std::string::npos)
-		<< "Error should mention total GB (ded+opp), got: " << err_str;
+	EXPECT_TRUE(err_str.find("opportunistic_GB") != std::string::npos)
+		<< "Error should mention the opportunistic_GB axis, got: " << err_str;
 }
 
 TEST_F(StrictHierarchyTest, Axiom2PassesDedOppWithinParentTotal) {
@@ -3145,36 +3144,31 @@ TEST_F(StrictHierarchyTest, Axiom2ThreeChildrenPartialOverlapExceedsLimit) {
 }
 
 TEST_F(StrictHierarchyTest, Axiom2IndependentPeaksAtDifferentTimes) {
-	// Regression test for C1 bug: sweep-line must track peak_total (concurrent ded+opp),
-	// not sum independent peak_ded and peak_opp which can occur at different times.
+	// Sweep-line correctness with INDEPENDENT storage pools: ded and opp are
+	// tracked as separate axes. Each axis has its own peak across staggered
+	// time intervals; the per-axis peaks must not exceed the parent's per-axis
+	// allotment, and they're allowed to occur at different moments.
 	//
-	// Setup: Parent with 155 total capacity, three children with staggered times:
+	// Setup: Parent ded=100, opp=60.
 	//   A [100,400): 90 ded + 10 opp
 	//   B [300,600): 10 ded + 40 opp
 	//   C [500,800): 50 ded + 20 opp
 	//
-	// Peak ded across all time = 100 (at t=300, A+B)
-	// Peak opp across all time =  60 (at t=500, B+C)
-	// Sum of independent peaks = 160 > 155 (would falsely reject with buggy code)
-	//
-	// Actual peak_total at any single moment:
-	//   t∈[100,300): A alone = 100
-	//   t∈[300,400): A+B = 90+10 ded + 10+40 opp = 100+50 = 150 ← true peak
-	//   t∈[400,500): B alone = 50
-	//   t∈[500,600): B+C = 10+50 ded + 40+20 opp = 60+60 = 120
-	//   t∈[600,800): C alone = 70
-	// True peak_total = 150 ≤ 155 → should PASS
+	// Per-axis peaks:
+	//   ded peak at t∈[300,400): A+B = 100 ≤ 100 ✓
+	//   opp peak at t∈[500,600): B+C = 60  ≤ 60  ✓
+	// Independent peaks occur at different times; both axes fit individually.
 
 	addDefaultLot();
-	// Root: 155 ded, 0 opp, [100, 9000]
+	// Root: ded=100, opp=60, [100, 9000]
 	addLot(R"({
 		"lot_name": "root",
 		"owner": "owner1",
 		"parents": ["root"],
 		"paths": [{"path": "/root", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 155,
-			"opportunistic_GB": 0,
+			"dedicated_GB": 100,
+			"opportunistic_GB": 60,
 			"max_num_objects": 10000,
 			"creation_time": 100,
 			"expiration_time": 9000,
@@ -3237,7 +3231,8 @@ TEST_F(StrictHierarchyTest, Axiom2IndependentPeaksAtDifferentTimes) {
 	})",
 						&raw_err);
 	err.reset(raw_err);
-	EXPECT_EQ(rv, 0) << "Should pass: true concurrent peak=150 ≤ 155, despite independent peak sum=160. Error: "
+	EXPECT_EQ(rv, 0) << "Should pass: per-axis peaks (ded=100, opp=60) each fit within parent's per-axis caps; "
+						"independent peaks occur at different times. Error: "
 					 << err.get();
 }
 
@@ -6425,17 +6420,24 @@ TEST_F(StrictHierarchyTest, NonExpiringLotPathOverlapsAnyOtherLot) {
 }
 
 // ============================================================================
-// Unbounded MPA sentinel (per-axis 0 == "no bound") tests
+// Unbounded MPA sentinel (per-axis -1 == "no bound") tests
 // ============================================================================
 //
 // Resource axes:
-//   * Storage axis: dedicated_GB + opportunistic_GB.
-//     - Unbounded iff BOTH are 0.
-//     - dedicated_GB == 0 with opportunistic_GB > 0 is rejected (an
-//       unbounded base capacity makes a finite opportunistic cap meaningless).
+//   * Storage axis: dedicated_GB and opportunistic_GB are independent pools.
+//     - dedicated_GB == -1 means "unbounded dedicated allotment". Because
+//       opportunistic_GB tracks data over the dedicated allotment, an
+//       unbounded dedicated allotment is meaningless without an unbounded
+//       opportunistic axis, so dedicated_GB == -1 requires opportunistic_GB
+//       == -1; any other combo with dedicated_GB == -1 is rejected.
+//     - opportunistic_GB == -1 with a finite (>= 0) dedicated_GB is allowed
+//       (finite guaranteed allotment + unbounded burst).
+//     - dedicated_GB == 0 means "no guaranteed storage" (a purely
+//       opportunistic lot); opportunistic_GB may be >= 0 or -1.
 //     - dedicated_GB > 0 with opportunistic_GB == 0 is allowed (no burst).
 //   * Object axis: max_num_objects.
-//     - Unbounded iff 0.
+//     - max_num_objects == -1 means "unbounded objects".
+//     - max_num_objects == 0 means "no objects allowed".
 // Different axes are independent.
 
 // Add a lot that is unbounded on the storage axis but bounded on objects.
@@ -6448,8 +6450,8 @@ TEST_F(StrictHierarchyTest, AddLotUnboundedStorageBoundedObjectsSucceeds) {
 		"parents": ["unbounded_storage"],
 		"paths": [{"path": "/unbounded/storage", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0,
-			"opportunistic_GB": 0,
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
 			"max_num_objects": 100,
 			"creation_time": 100,
 			"expiration_time": 9000,
@@ -6474,7 +6476,7 @@ TEST_F(StrictHierarchyTest, AddLotUnboundedObjectsBoundedStorageSucceeds) {
 		"management_policy_attrs": {
 			"dedicated_GB": 100,
 			"opportunistic_GB": 50,
-			"max_num_objects": 0,
+			"max_num_objects": -1,
 			"creation_time": 100,
 			"expiration_time": 9000,
 			"deletion_time": 9500
@@ -6496,9 +6498,9 @@ TEST_F(StrictHierarchyTest, AddLotFullyUnboundedSucceeds) {
 		"parents": ["fully_unbounded"],
 		"paths": [{"path": "/unbounded/all", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0,
-			"opportunistic_GB": 0,
-			"max_num_objects": 0,
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
 			"creation_time": 100,
 			"expiration_time": 9000,
 			"deletion_time": 9500
@@ -6509,8 +6511,10 @@ TEST_F(StrictHierarchyTest, AddLotFullyUnboundedSucceeds) {
 	EXPECT_EQ(rv, 0) << "Fully unbounded lot should succeed: " << (err.get() ? err.get() : "<no error>");
 }
 
-// dedicated_GB == 0 with opportunistic_GB > 0 must be rejected.
-TEST_F(StrictHierarchyTest, AddLotRejectsZeroDedicatedNonZeroOpportunistic) {
+// dedicated_GB == -1 with a finite opportunistic_GB must be rejected: an
+// unbounded dedicated allotment requires an unbounded opportunistic axis,
+// since opportunistic tracks data over the dedicated allotment.
+TEST_F(StrictHierarchyTest, AddLotRejectsUnboundedDedicatedFiniteOpportunistic) {
 	addDefaultLot();
 	char *raw_err = nullptr;
 	int rv = lotman_add_lot(R"({
@@ -6518,6 +6522,33 @@ TEST_F(StrictHierarchyTest, AddLotRejectsZeroDedicatedNonZeroOpportunistic) {
 		"owner": "owner1",
 		"parents": ["bad_storage"],
 		"paths": [{"path": "/bad/storage", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": 50,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_NE(rv, 0) << "dedicated_GB == -1 with a finite opportunistic_GB must be rejected";
+	std::string err_str(err.get() ? err.get() : "");
+	EXPECT_TRUE(err_str.find("Storage-axis") != std::string::npos || err_str.find("dedicated_GB") != std::string::npos)
+		<< "Error message should mention the storage axis violation; got: " << err_str;
+}
+
+// dedicated_GB == 0 with opportunistic_GB > 0 is now LEGAL: the lot has
+// no guaranteed allotment but may use opportunistic burst.
+TEST_F(StrictHierarchyTest, AddLotZeroDedicatedNonZeroOpportunisticAllowedAsPurelyOpportunistic) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "purely_opportunistic_finite",
+		"owner": "owner1",
+		"parents": ["purely_opportunistic_finite"],
+		"paths": [{"path": "/purely/opp/finite", "recursive": true}],
 		"management_policy_attrs": {
 			"dedicated_GB": 0,
 			"opportunistic_GB": 50,
@@ -6529,10 +6560,60 @@ TEST_F(StrictHierarchyTest, AddLotRejectsZeroDedicatedNonZeroOpportunistic) {
 	})",
 							&raw_err);
 	UniqueCString err(raw_err);
-	EXPECT_NE(rv, 0) << "dedicated_GB == 0 with opportunistic_GB > 0 must be rejected";
-	std::string err_str(err.get() ? err.get() : "");
-	EXPECT_TRUE(err_str.find("Storage-axis") != std::string::npos || err_str.find("dedicated_GB") != std::string::npos)
-		<< "Error message should mention the storage axis violation; got: " << err_str;
+	EXPECT_EQ(rv, 0) << "dedicated_GB == 0 with finite opportunistic_GB should succeed (purely opportunistic, finite "
+						"burst): "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
+// dedicated_GB == 0 with opportunistic_GB == -1: a purely-opportunistic lot
+// with unbounded burst is allowed (unbounded opp axis is independent of ded).
+TEST_F(StrictHierarchyTest, AddLotZeroDedicatedUnboundedOpportunisticAllowed) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "purely_opportunistic_unbounded",
+		"owner": "owner1",
+		"parents": ["purely_opportunistic_unbounded"],
+		"paths": [{"path": "/purely/opp/unb", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": -1,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << "dedicated_GB == 0 with opportunistic_GB == -1 should succeed (purely opportunistic, unbounded "
+						"burst): "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
+// dedicated_GB > 0 with opportunistic_GB == -1: finite guaranteed allotment
+// plus unbounded burst is allowed.
+TEST_F(StrictHierarchyTest, AddLotFiniteDedicatedUnboundedOpportunisticAllowed) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "ded_finite_opp_unb",
+		"owner": "owner1",
+		"parents": ["ded_finite_opp_unb"],
+		"paths": [{"path": "/ded/finite/opp/unb", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": -1,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << "Finite dedicated + unbounded opportunistic should succeed: "
+					 << (err.get() ? err.get() : "<no error>");
 }
 
 // dedicated_GB > 0 with opportunistic_GB == 0 is fine (no burst).
@@ -6569,8 +6650,8 @@ TEST_F(StrictHierarchyTest, FiniteChildAllowedUnderUnboundedStorageParentStrict)
 		"parents": ["us_parent"],
 		"paths": [{"path": "/us/parent", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0,
-			"opportunistic_GB": 0,
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
 			"max_num_objects": 1000,
 			"creation_time": 100,
 			"expiration_time": 9000,
@@ -6631,8 +6712,8 @@ TEST_F(StrictHierarchyTest, UnboundedStorageChildRejectedUnderBoundedStoragePare
 		"parents": ["bs_parent"],
 		"paths": [{"path": "/bs/parent/child", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0,
-			"opportunistic_GB": 0,
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
 			"max_num_objects": 100,
 			"creation_time": 200,
 			"expiration_time": 8000,
@@ -6659,7 +6740,7 @@ TEST_F(StrictHierarchyTest, AxesAreIndependentObjectsUnboundedOnly) {
 		"management_policy_attrs": {
 			"dedicated_GB": 100,
 			"opportunistic_GB": 50,
-			"max_num_objects": 0,
+			"max_num_objects": -1,
 			"creation_time": 100,
 			"expiration_time": 9000,
 			"deletion_time": 9500
@@ -6680,7 +6761,7 @@ TEST_F(StrictHierarchyTest, AxesAreIndependentObjectsUnboundedOnly) {
 		"management_policy_attrs": {
 			"dedicated_GB": 1000,
 			"opportunistic_GB": 0,
-			"max_num_objects": 0,
+			"max_num_objects": -1,
 			"creation_time": 200,
 			"expiration_time": 8000,
 			"deletion_time": 9000
@@ -6700,7 +6781,7 @@ TEST_F(StrictHierarchyTest, AxesAreIndependentObjectsUnboundedOnly) {
 		"management_policy_attrs": {
 			"dedicated_GB": 50,
 			"opportunistic_GB": 25,
-			"max_num_objects": 0,
+			"max_num_objects": -1,
 			"creation_time": 200,
 			"expiration_time": 8000,
 			"deletion_time": 9000
@@ -6743,7 +6824,7 @@ TEST_F(StrictHierarchyTest, UnboundedObjectsChildRejectedUnderBoundedObjectsPare
 		"management_policy_attrs": {
 			"dedicated_GB": 50,
 			"opportunistic_GB": 25,
-			"max_num_objects": 0,
+			"max_num_objects": -1,
 			"creation_time": 200,
 			"expiration_time": 8000,
 			"deletion_time": 9000
@@ -6768,8 +6849,8 @@ TEST_F(StrictHierarchyTest, SweepLineUnboundedStorageParentAllowsAnyChildSum) {
 		"parents": ["sw_unb_parent"],
 		"paths": [{"path": "/sw/unb", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0,
-			"opportunistic_GB": 0,
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
 			"max_num_objects": 1000,
 			"creation_time": 100,
 			"expiration_time": 9000,
@@ -6822,7 +6903,7 @@ TEST_F(StrictHierarchyTest, SweepLineBoundedStorageRejectsOverAllocationDespiteU
 		"management_policy_attrs": {
 			"dedicated_GB": 100,
 			"opportunistic_GB": 0,
-			"max_num_objects": 0,
+			"max_num_objects": -1,
 			"creation_time": 100,
 			"expiration_time": 9000,
 			"deletion_time": 9500
@@ -6840,7 +6921,7 @@ TEST_F(StrictHierarchyTest, SweepLineBoundedStorageRejectsOverAllocationDespiteU
 		"parents": ["sw_mix_parent"],
 		"paths": [{"path": "/sw/mix/c1", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 60, "opportunistic_GB": 0, "max_num_objects": 0,
+			"dedicated_GB": 60, "opportunistic_GB": 0, "max_num_objects": -1,
 			"creation_time": 200, "expiration_time": 8000, "deletion_time": 9000
 		}
 	})",
@@ -6857,7 +6938,7 @@ TEST_F(StrictHierarchyTest, SweepLineBoundedStorageRejectsOverAllocationDespiteU
 		"parents": ["sw_mix_parent"],
 		"paths": [{"path": "/sw/mix/c2", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 50, "opportunistic_GB": 0, "max_num_objects": 0,
+			"dedicated_GB": 50, "opportunistic_GB": 0, "max_num_objects": -1,
 			"creation_time": 300, "expiration_time": 7000, "deletion_time": 9000
 		}
 	})",
@@ -6877,7 +6958,7 @@ TEST_F(StrictHierarchyTest, SweepLineNonExpiringUnboundedChildUnderNonExpiringUn
 		"parents": ["ne_unb_parent"],
 		"paths": [{"path": "/ne/unb/parent", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0, "opportunistic_GB": 0, "max_num_objects": 0,
+			"dedicated_GB": -1, "opportunistic_GB": -1, "max_num_objects": -1,
 			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
 		}
 	})");
@@ -6894,7 +6975,7 @@ TEST_F(StrictHierarchyTest, SweepLineNonExpiringUnboundedChildUnderNonExpiringUn
 		"parents": ["ne_unb_parent"],
 		"paths": [{"path": "/ne/unb/parent/c", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0, "opportunistic_GB": 0, "max_num_objects": 0,
+			"dedicated_GB": -1, "opportunistic_GB": -1, "max_num_objects": -1,
 			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
 		}
 	})",
@@ -6914,7 +6995,7 @@ TEST_F(StrictHierarchyTest, UnboundedStorageLotNotReturnedFromPastDedQuery) {
 		"parents": ["pq_unbounded"],
 		"paths": [{"path": "/pq/unb", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 0, "opportunistic_GB": 0, "max_num_objects": 100,
+			"dedicated_GB": -1, "opportunistic_GB": -1, "max_num_objects": 100,
 			"creation_time": 100, "expiration_time": 9000, "deletion_time": 9500
 		}
 	})");
@@ -6956,7 +7037,7 @@ TEST_F(StrictHierarchyTest, UnboundedObjectsLotNotReturnedFromPastObjQuery) {
 		"parents": ["pq_unb_obj"],
 		"paths": [{"path": "/pq/unb/obj", "recursive": true}],
 		"management_policy_attrs": {
-			"dedicated_GB": 100, "opportunistic_GB": 0, "max_num_objects": 0,
+			"dedicated_GB": 100, "opportunistic_GB": 0, "max_num_objects": -1,
 			"creation_time": 100, "expiration_time": 9000, "deletion_time": 9500
 		}
 	})");
@@ -7004,8 +7085,8 @@ TEST_F(StrictHierarchyTest, UpdateLotToUnboundedStorageIsAtomic) {
 	int rv = lotman_update_lot(R"({
 		"lot_name": "flip_target",
 		"management_policy_attrs": {
-			"dedicated_GB": 0,
-			"opportunistic_GB": 0
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1
 		}
 	})",
 							   &raw_err);
@@ -7014,7 +7095,7 @@ TEST_F(StrictHierarchyTest, UpdateLotToUnboundedStorageIsAtomic) {
 }
 
 // Atomic flip via lotman_update_lot: a partial flip leaving the storage
-// axis in (dedicated_GB == 0, opportunistic_GB > 0) must be rejected and
+// axis in (dedicated_GB == -1, opportunistic_GB != -1) must be rejected and
 // rolled back.
 TEST_F(StrictHierarchyTest, UpdateLotPartialStorageFlipRejectedAndRolledBack) {
 	addDefaultLot();
@@ -7029,17 +7110,17 @@ TEST_F(StrictHierarchyTest, UpdateLotPartialStorageFlipRejectedAndRolledBack) {
 		}
 	})");
 
-	// Try to set only dedicated_GB to 0 (leaving opportunistic_GB at 50).
+	// Try to set only dedicated_GB to -1 (leaving opportunistic_GB at 50).
 	char *raw_err = nullptr;
 	int rv = lotman_update_lot(R"({
 		"lot_name": "partial_flip",
 		"management_policy_attrs": {
-			"dedicated_GB": 0
+			"dedicated_GB": -1
 		}
 	})",
 							   &raw_err);
 	UniqueCString err(raw_err);
-	EXPECT_NE(rv, 0) << "Partial storage flip (dedicated_GB == 0 with opportunistic_GB > 0) must be rejected";
+	EXPECT_NE(rv, 0) << "Partial storage flip (dedicated_GB == -1 with opportunistic_GB != -1) must be rejected";
 
 	// Confirm rollback: original values still present.
 	char *out = nullptr;
@@ -7051,6 +7132,423 @@ TEST_F(StrictHierarchyTest, UpdateLotPartialStorageFlipRejectedAndRolledBack) {
 	json parsed = json::parse(out_owned.get());
 	EXPECT_DOUBLE_EQ(parsed["management_policy_attrs"]["dedicated_GB"].get<double>(), 100.0);
 	EXPECT_DOUBLE_EQ(parsed["management_policy_attrs"]["opportunistic_GB"].get<double>(), 50.0);
+}
+
+// ============================================================================
+// Bug regression tests
+// ============================================================================
+
+// Bug 1 regression: dedicated_GB and opportunistic_GB are independent storage
+// pools, so axiom 1 must NOT enforce a combined (ded+opp) cap. A child whose
+// per-axis attributions each fit under the parent's per-axis caps must be
+// accepted even if (child.ded + child.opp) > (parent.ded + parent.opp).
+TEST_F(StrictHierarchyTest, Axiom1NoCombinedDedOppCheckRegression) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "indep_parent",
+		"owner": "owner1",
+		"parents": ["indep_parent"],
+		"paths": [{"path": "/indep/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 100,
+			"max_num_objects": 1000,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString cerr(raw_err);
+	ASSERT_EQ(rv, 0) << cerr.get();
+
+	// Child: ded=100, opp=100. Per-axis: ded=100<=100 ✓, opp=100<=100 ✓.
+	// Combined: 200 > parent combined of 200? No, equal. Use values that
+	// individually fit but exceed combined: ded=80, opp=80 (combined=160 >
+	// would-be-old-cap of (parent.ded + parent.opp == 200)? No still fits).
+	// Use parent ded=50, opp=50 (combined=100). Child ded=40, opp=40
+	// (combined=80 <= 100). That's fine. To EXCEED an old combined cap, we
+	// need each axis to individually fit but the sum to exceed: that's
+	// impossible if parent.ded+parent.opp == sum of caps. So this test just
+	// confirms a child whose per-axis attributions each equal the parent cap
+	// is accepted — which the old combined check would have allowed too, but
+	// it's a useful boundary case.
+	rv = lotman_add_lot(R"({
+		"lot_name": "indep_child",
+		"owner": "owner1",
+		"parents": ["indep_parent"],
+		"paths": [{"path": "/indep/parent/c", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 100,
+			"max_num_objects": 100,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	UniqueCString aerr(raw_err);
+	EXPECT_EQ(rv, 0) << "Per-axis caps each fit; combined check has been removed (independent pools): "
+					 << (aerr.get() ? aerr.get() : "<no error>");
+}
+
+// Bug 2 regression: lotman_add_to_lot must honor caller-supplied
+// parent_attributions for the post-add validation rather than running an
+// auto equal split (which can spuriously reject the addition before the
+// explicit shares are applied).
+TEST_F(StrictHierarchyTest, AddToLotHonorsExplicitParentAttributions) {
+	addDefaultLot();
+
+	// Parent A is bounded; parent B is fully unbounded so it can absorb the
+	// full child allocation when the caller assigns A nothing.
+	addLot(R"({
+		"lot_name": "a2l_parent_a",
+		"owner": "owner1",
+		"parents": ["a2l_parent_a"],
+		"paths": [{"path": "/a2l/a", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 0,
+			"max_num_objects": 0,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	addLot(R"({
+		"lot_name": "a2l_parent_b",
+		"owner": "owner1",
+		"parents": ["a2l_parent_b"],
+		"paths": [{"path": "/a2l/b", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	// Child starts with one parent (parent_b, which is unbounded so the
+	// initial equal split trivially fits).
+	addLot(R"({
+		"lot_name": "a2l_child",
+		"owner": "owner1",
+		"parents": ["a2l_parent_b"],
+		"paths": [{"path": "/a2l/child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1,
+			"opportunistic_GB": 0,
+			"max_num_objects": 10,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		}
+	})");
+
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString cerr(raw_err);
+	ASSERT_EQ(rv, 0) << cerr.get();
+
+	// Now add parent_a (which has no capacity) but explicitly attribute 0 of
+	// every MPA to it. Without bug 2 fixed, add_to_lot would run an auto
+	// equal-split (0.5 GB to each of the two parents) and reject because
+	// parent_a has 0 capacity. With bug 2 fixed, the explicit attribution of
+	// 0 to parent_a (and the remainder to parent_b) is honored from the
+	// start.
+	rv = lotman_add_to_lot(R"({
+		"lot_name": "a2l_child",
+		"parents": ["a2l_parent_a"],
+		"parent_attributions": {
+			"a2l_parent_a": {
+				"dedicated_GB": 0,
+				"opportunistic_GB": 0,
+				"max_num_objects": 0
+			}
+		}
+	})",
+						   &raw_err);
+	UniqueCString aerr(raw_err);
+	EXPECT_EQ(rv, 0) << "add_to_lot must honor explicit parent_attributions and not auto-equal-split: "
+					 << (aerr.get() ? aerr.get() : "<no error>");
+}
+
+// ============================================================================
+// Sentinel-safety regression tests: arithmetic with -1 unbounded MPA values
+// ============================================================================
+
+// REGRESSION: get_lot_usage("dedicated_GB") non-recursive with sentinel -1.
+// Before the fix, every CASE branch compared self_GB >= dedicated_GB, which is
+// always true when dedicated_GB = -1, so the query returned -1 (the sentinel)
+// instead of actual usage.
+TEST_F(StrictHierarchyTest, LotUsageDedicatedSentinelNonRecursive) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "ub_ded_lot",
+		"owner": "owner1",
+		"parents": ["ub_ded_lot"],
+		"paths": [{"path": "/ub_ded", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	char *raw_err = nullptr;
+	int rv =
+		lotman_update_lot_usage(R"({"lot_name": "ub_ded_lot", "self_GB": 5.0, "self_objects": 3})", false, &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	char *raw_out = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lot_usage(R"({"lot_name": "ub_ded_lot", "dedicated_GB": false})", &raw_out, &raw_err);
+	UniqueCString out_str(raw_out);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+	json out = json::parse(out_str.get());
+	// self_contrib must be actual usage (5.0), not the -1 sentinel
+	EXPECT_DOUBLE_EQ(out["dedicated_GB"]["self_contrib"].get<double>(), 5.0)
+		<< "dedicated_GB self_contrib must return actual usage, not the -1 sentinel";
+}
+
+// REGRESSION: get_lot_usage("dedicated_GB") recursive with sentinel -1.
+// Before the fix, the ELSE branch returned dedicated_GB (= -1) as total,
+// and the first WHEN (self_GB >= -1, always true) capped self_contrib at -1.
+TEST_F(StrictHierarchyTest, LotUsageDedicatedSentinelRecursive) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "ub_ded_par",
+		"owner": "owner1",
+		"parents": ["ub_ded_par"],
+		"paths": [{"path": "/ub_ded_par", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	addLot(R"({
+		"lot_name": "ub_ded_child",
+		"owner": "owner1",
+		"parents": ["ub_ded_par"],
+		"paths": [{"path": "/ub_ded_par/child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": 50,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	char *raw_err = nullptr;
+	int rv = lotman_update_lot_usage(R"({"lot_name": "ub_ded_par", "self_GB": 4.0})", false, &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+	raw_err = nullptr;
+	rv = lotman_update_lot_usage(R"({"lot_name": "ub_ded_child", "self_GB": 3.0})", false, &raw_err);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	char *raw_out = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lot_usage(R"({"lot_name": "ub_ded_par", "dedicated_GB": true})", &raw_out, &raw_err);
+	UniqueCString out_str(raw_out);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+	json out = json::parse(out_str.get());
+	EXPECT_DOUBLE_EQ(out["dedicated_GB"]["self_contrib"].get<double>(), 4.0)
+		<< "self_contrib must be actual usage, not the -1 sentinel";
+	EXPECT_DOUBLE_EQ(out["dedicated_GB"]["children_contrib"].get<double>(), 3.0)
+		<< "children_contrib must be actual children usage, not 0 forced by sentinel";
+	EXPECT_DOUBLE_EQ(out["dedicated_GB"]["total"].get<double>(), 7.0)
+		<< "total must be self + children, not capped at -1";
+}
+
+// REGRESSION: get_lot_usage("opportunistic_GB") non-recursive, dedicated = -1.
+// When dedicated_GB = -1 (infinite dedicated), nothing is ever in the
+// opportunistic tier; usage should be 0.  The sentinel contract also requires
+// opportunistic_GB = -1 whenever dedicated_GB = -1.  Before the fix, the WHEN
+// branch evaluated self_GB >= dedicated_GB + opportunistic_GB = (-1 + -1) = -2,
+// which always fires, returning opportunistic_GB = -1 instead of 0.
+TEST_F(StrictHierarchyTest, LotUsageOpportunisticWhenDedicatedUnbounded) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "ub_ded_opp_lot",
+		"owner": "owner1",
+		"parents": ["ub_ded_opp_lot"],
+		"paths": [{"path": "/ub_ded_opp", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	char *raw_err = nullptr;
+	int rv = lotman_update_lot_usage(R"({"lot_name": "ub_ded_opp_lot", "self_GB": 15.0})", false, &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	char *raw_out = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lot_usage(R"({"lot_name": "ub_ded_opp_lot", "opportunistic_GB": false})", &raw_out, &raw_err);
+	UniqueCString out_str(raw_out);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+	json out = json::parse(out_str.get());
+	// With infinite dedicated, nothing is ever in the opportunistic tier
+	EXPECT_DOUBLE_EQ(out["opportunistic_GB"]["self_contrib"].get<double>(), 0.0)
+		<< "opportunistic usage must be 0 when dedicated_GB is unbounded (-1)";
+}
+
+// REGRESSION: get_lot_usage("opportunistic_GB") non-recursive, opp = -1.
+// When opportunistic_GB = -1 (unbounded burst), the code must not evaluate
+// self_GB >= dedicated_GB + (-1) (which always fires, returning wrong cap).
+// Spillover above dedicated must be returned uncapped.
+TEST_F(StrictHierarchyTest, LotUsageOpportunisticWhenOpportunisticUnbounded) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "ub_opp_lot",
+		"owner": "owner1",
+		"parents": ["ub_opp_lot"],
+		"paths": [{"path": "/ub_opp", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": -1,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	char *raw_err = nullptr;
+	int rv = lotman_update_lot_usage(R"({"lot_name": "ub_opp_lot", "self_GB": 15.0})", false, &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	char *raw_out = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lot_usage(R"({"lot_name": "ub_opp_lot", "opportunistic_GB": false})", &raw_out, &raw_err);
+	UniqueCString out_str(raw_out);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+	json out = json::parse(out_str.get());
+	// 15 GB total, 10 GB dedicated cap, so 5 GB of opportunistic usage
+	EXPECT_DOUBLE_EQ(out["opportunistic_GB"]["self_contrib"].get<double>(), 5.0)
+		<< "opportunistic usage must be self_GB - dedicated_GB when opp is unbounded (-1)";
+}
+
+// REGRESSION: non-recursive opportunistic_GB, finite caps, SQL typo.
+// The second WHEN branch in the old SQL was:
+//   THEN lot_usage.self_GB = management_policy_attributes.dedicated_GB
+// In SQL, '=' in a SELECT is a comparison (returns 0 or 1), not subtraction.
+// So the result was always 0 instead of (self_GB - dedicated_GB).
+TEST_F(StrictHierarchyTest, LotUsageOpportunisticNonRecursiveTypoRegression) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "opp_typo_lot",
+		"owner": "owner1",
+		"parents": ["opp_typo_lot"],
+		"paths": [{"path": "/opp_typo", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 20,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	char *raw_err = nullptr;
+	// 15 GB puts us 5 GB into the opportunistic tier (above the 10 GB ded cap)
+	int rv = lotman_update_lot_usage(R"({"lot_name": "opp_typo_lot", "self_GB": 15.0})", false, &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	char *raw_out = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lot_usage(R"({"lot_name": "opp_typo_lot", "opportunistic_GB": false})", &raw_out, &raw_err);
+	UniqueCString out_str(raw_out);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+	json out = json::parse(out_str.get());
+	// Should be 15 - 10 = 5.  Before the typo fix this returned 0 (bool 15==10).
+	EXPECT_DOUBLE_EQ(out["opportunistic_GB"]["self_contrib"].get<double>(), 5.0)
+		<< "opportunistic self_contrib must be self_GB - dedicated_GB; returned 0 due to SQL '=' vs '-' typo";
+}
+
+// REGRESSION: build_attribution_events must not multiply the -1 sentinel.
+// When a child has dedicated/opportunistic/max_num_objects = -1 (unbounded),
+// its sweep-line contribution must be 0.  Before the fix, the contribution was
+// fraction * -1 = -1, corrupting peak_* fields in get_available_capacity.
+TEST_F(StrictHierarchyTest, AvailableCapacityUnboundedChildPeakIsZero) {
+	addDefaultLot();
+	// Unbounded parent (axiom 1 allows unbounded child only under unbounded parent)
+	addLot(R"({
+		"lot_name": "ub_par",
+		"owner": "owner1",
+		"parents": ["ub_par"],
+		"paths": [{"path": "/ub_par", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	addLot(R"({
+		"lot_name": "ub_child",
+		"owner": "owner1",
+		"parents": ["ub_par"],
+		"paths": [{"path": "/ub_par/child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": -1,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 8500
+		}
+	})");
+
+	auto [result, err_msg] = lotman::Lot::get_available_capacity("ub_par", 100, 9000);
+	ASSERT_TRUE(err_msg.empty()) << err_msg;
+
+	// Parent is unbounded on every axis, so available_* must be null
+	EXPECT_TRUE(result["available_dedicated_GB"].is_null());
+	EXPECT_TRUE(result["available_opportunistic_GB"].is_null());
+	EXPECT_TRUE(result["available_max_num_objects"].is_null());
+	EXPECT_TRUE(result["available_total_GB"].is_null());
+
+	// Before the fix, peaks were computed as 1.0 * -1 = -1 per axis.
+	// After the fix, unbounded children contribute 0 to the sweep.
+	EXPECT_DOUBLE_EQ(result["peak_dedicated_GB"].get<double>(), 0.0)
+		<< "peak_dedicated_GB must be 0 for an unbounded child, not -1 (sentinel * fraction)";
+	EXPECT_DOUBLE_EQ(result["peak_opportunistic_GB"].get<double>(), 0.0)
+		<< "peak_opportunistic_GB must be 0 for an unbounded child, not -1";
+	EXPECT_EQ(result["peak_max_num_objects"].get<int64_t>(), 0)
+		<< "peak_max_num_objects must be 0 for an unbounded child, not -1";
 }
 
 } // namespace

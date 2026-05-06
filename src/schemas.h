@@ -93,19 +93,19 @@ inline json new_lot_schema = []() {
             "additionalProperties": false,
             "properties": {
                 "dedicated_GB": {
-                    "description": "Amount of dedicated storage attributed to the lot, in GB",
+                    "description": "Amount of dedicated storage attributed to the lot, in GB. -1 marks the dedicated axis as unbounded; in that case opportunistic_GB must also be -1.",
                     "type": "number",
-                    "minimum": 0
+                    "minimum": -1
                 },
                 "opportunistic_GB": {
-                    "description": "Amount of opportunistic storage attributed to the lot, in GB",
+                    "description": "Amount of opportunistic storage attributed to the lot, in GB. -1 marks the opportunistic axis as unbounded.",
                     "type": "number",
-                    "minimum": 0
+                    "minimum": -1
                 },
                 "max_num_objects": {
-                    "description": "Max number of objects a lot should have",
+                    "description": "Max number of objects a lot should have. -1 marks the object axis as unbounded.",
                     "type": "number",
-                    "minimum": 0,
+                    "minimum": -1,
                     "multipleOf": 1
                 },
                 "creation_time": {
@@ -215,19 +215,19 @@ inline json lot_update_schema = []() {
             "additionalProperties": false,
             "properties": {
                 "dedicated_GB": {
-                    "description": "Amount of dedicated storage attributed to the lot, in GB",
+                    "description": "Amount of dedicated storage attributed to the lot, in GB. -1 marks the dedicated axis as unbounded; in that case opportunistic_GB must also be -1.",
                     "type": "number",
-                    "minimum": 0
+                    "minimum": -1
                 },
                 "opportunistic_GB": {
-                    "description": "Amount of opportunistic storage attributed to the lot, in GB",
+                    "description": "Amount of opportunistic storage attributed to the lot, in GB. -1 marks the opportunistic axis as unbounded.",
                     "type": "number",
-                    "minimum": 0
+                    "minimum": -1
                 },
                 "max_num_objects": {
-                    "description": "Max number of objects a lot should have",
+                    "description": "Max number of objects a lot should have. -1 marks the object axis as unbounded.",
                     "type": "number",
-                    "minimum": 0,
+                    "minimum": -1,
                     "multipleOf": 1
                 },
                 "creation_time": {

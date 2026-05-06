@@ -46,54 +46,62 @@ inline bool is_non_expiring(int64_t creation_time, int64_t expiration_time, int6
 	return creation_time == 0 && expiration_time == 0 && deletion_time == 0;
 }
 
-// Resource-axis sentinels: a value of 0 on a quota MPA marks that axis as
-// "unbounded". MPAs are grouped into independent axes that are validated
-// internally but treated independently of each other:
-//   * Storage axis: dedicated_GB and opportunistic_GB. The storage axis is
-//     unbounded iff both are 0. Mixing (dedicated_GB == 0 with
-//     opportunistic_GB > 0) is rejected -- if the dedicated capacity is
-//     unbounded, a finite opportunistic cap is meaningless. The reverse
-//     (dedicated_GB > 0 with opportunistic_GB == 0) is allowed and means
-//     the lot has no opportunistic burst capacity.
-//   * Object-count axis: max_num_objects. Unbounded iff 0.
-// Different axes are independent: a lot may be unbounded on one axis and
-// bounded on another.
-inline bool is_unbounded_storage(double dedicated_GB, double opportunistic_GB) {
-	return dedicated_GB == 0.0 && opportunistic_GB == 0.0;
+// Resource-axis sentinels: a value of -1 on a quota MPA marks that axis as
+// "unbounded". 0 is therefore reserved for its literal meaning ("zero
+// guaranteed storage", "zero burst capacity", "zero objects allowed"), so
+// callers can express purely-opportunistic lots, no-burst lots, etc.
+//
+// The three resource MPAs are treated as three independent sub-axes:
+//   * dedicated_GB:     -1 == unbounded, 0 == no guaranteed storage.
+//   * opportunistic_GB: -1 == unbounded burst, 0 == no burst capacity.
+//   * max_num_objects:  -1 == unbounded, 0 == no objects allowed.
+//
+// Cross-axis storage rule: an unbounded dedicated cap with a finite
+// opportunistic cap is meaningless (opportunistic is "data over the
+// dedicated allotment"); therefore (dedicated_GB == -1 && opportunistic_GB
+// != -1) is rejected. The reverse (finite dedicated, unbounded opportunistic)
+// is allowed and means "guaranteed N GB plus unlimited burst".
+inline bool is_unbounded_dedicated(double dedicated_GB) {
+	return dedicated_GB == -1.0;
+}
+
+inline bool is_unbounded_opportunistic(double opportunistic_GB) {
+	return opportunistic_GB == -1.0;
 }
 
 inline bool is_unbounded_objects(int64_t max_num_objects) {
-	return max_num_objects == 0;
+	return max_num_objects == -1;
 }
 
-// True when the storage axis is in a transient, inconsistent state that can
-// occur mid-transaction during a multi-field update (dedicated_GB has already
-// been set to 0 while opportunistic_GB has not yet been updated to match).
-// Hierarchy validation predicates short-circuit when they encounter this state
-// and rely on a post-loop check in lotman_update_lot to reject any persisting
-// partial state.
+// True when the storage axis is in the forbidden combination
+// (dedicated_GB == -1 with opportunistic_GB != -1). This may occur as a
+// transient state mid-transaction during a multi-field update where
+// dedicated_GB has been written first; hierarchy validation predicates
+// short-circuit when they encounter it and rely on a post-loop check in
+// lotman_update_lot to reject any persisting partial state.
 inline bool is_partial_storage_sentinel(double dedicated_GB, double opportunistic_GB) {
-	return dedicated_GB == 0.0 && opportunistic_GB > 0.0;
+	return dedicated_GB == -1.0 && opportunistic_GB != -1.0;
 }
 
 // Validate the per-axis MPA invariants for a lot:
-//   * All MPAs must be non-negative.
-//   * Storage axis: if dedicated_GB == 0, opportunistic_GB must also be 0.
+//   * Each MPA must be either >= 0 or exactly -1 (the unbounded sentinel).
+//   * Storage axis: dedicated_GB == -1 requires opportunistic_GB == -1.
 // Returns (true, "") when valid, otherwise (false, message).
 inline std::pair<bool, std::string> validate_mpa_invariants(double dedicated_GB, double opportunistic_GB,
 															int64_t max_num_objects) {
-	if (dedicated_GB < 0 || opportunistic_GB < 0 || max_num_objects < 0) {
-		return std::make_pair(false, std::string("MPAs must be non-negative; got dedicated_GB=") +
+	auto bad = [](double v) { return v < 0.0 && v != -1.0; };
+	if (bad(dedicated_GB) || bad(opportunistic_GB) || (max_num_objects < 0 && max_num_objects != -1)) {
+		return std::make_pair(false, std::string("MPAs must be >= 0 or exactly -1 (the unbounded sentinel); got "
+												 "dedicated_GB=") +
 										 std::to_string(dedicated_GB) +
 										 ", opportunistic_GB=" + std::to_string(opportunistic_GB) +
 										 ", max_num_objects=" + std::to_string(max_num_objects) + ".");
 	}
-	if (dedicated_GB == 0.0 && opportunistic_GB > 0.0) {
+	if (is_partial_storage_sentinel(dedicated_GB, opportunistic_GB)) {
 		return std::make_pair(
-			false, std::string("Storage-axis sentinel violation: when dedicated_GB is 0 (the unbounded sentinel), "
-							   "opportunistic_GB must also be 0. The storage axis must be either fully bounded "
-							   "(dedicated_GB > 0) or fully unbounded (both dedicated_GB and opportunistic_GB equal "
-							   "to 0). Got dedicated_GB=") +
+			false, std::string("Storage-axis sentinel violation: when dedicated_GB is -1 (unbounded), "
+							   "opportunistic_GB must also be -1. An unbounded dedicated allotment "
+							   "makes a finite opportunistic cap meaningless. Got dedicated_GB=") +
 					   std::to_string(dedicated_GB) + ", opportunistic_GB=" + std::to_string(opportunistic_GB) + ".");
 	}
 	return std::make_pair(true, "");
@@ -387,7 +395,11 @@ class Lot {
 	bool update_man_policy_attrs_in_txn(const std::string &update_key, double update_val, std::string &txn_error);
 	bool update_attributions_in_txn(const json &parent_attributions_json, std::string &txn_error);
 	bool add_paths_in_txn(const std::vector<json> &paths, std::string &txn_error);
-	bool add_parents_in_txn(const std::vector<Lot> &parents, std::string &txn_error);
+	// `parent_attributions_json` lets the caller supply explicit per-parent shares
+	// to use for the post-add equal-split / axiom validation; pass json() to fall
+	// back to a pure equal split across all parents.
+	bool add_parents_in_txn(const std::vector<Lot> &parents, std::string &txn_error,
+							const json &parent_attributions_json = json());
 
   private:
 	std::pair<bool, std::string> write_new();
@@ -409,13 +421,15 @@ class Lot {
 
 	// Non-transactional helpers for composing inside an outer transaction.
 	// Callers MUST hold an active storage.transaction().
-	bool add_parents_impl(const std::vector<Lot> &parents, std::string &txn_error);
+	bool add_parents_impl(const std::vector<Lot> &parents, std::string &txn_error,
+						  const json &parent_attributions_json = json());
 	bool update_parents_impl(const json &update_arr, std::string &txn_error);
 
-	// Reload parents + MPAs from DB, clear old attributions, recompute with equal split,
-	// and validate axioms. Caller MUST hold an active storage.transaction().
+	// Reload parents + MPAs from DB, clear old attributions, recompute with the
+	// supplied per-parent shares (equal split for any unspecified parents), and
+	// validate axioms. Caller MUST hold an active storage.transaction().
 	// Returns false and sets txn_error on failure.
-	bool reload_and_recompute_attributions(std::string &txn_error);
+	bool reload_and_recompute_attributions(std::string &txn_error, const json &parent_attributions_json = json());
 };
 
 class DirUsageUpdate : public Lot {
