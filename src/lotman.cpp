@@ -358,15 +358,16 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 				}
 
 				// After all per-field MPA updates have been applied, re-load
-				// the lot's final timestamp triple and enforce the sentinel
-				// invariant. Per-field updates intentionally tolerate
+				// the lot's final MPA triple and enforce the sentinel
+				// invariants. Per-field updates intentionally tolerate
 				// transient partial-zero state inside the transaction so a
-				// caller can flip a lot to/from non-expiring atomically; this
-				// final pass rejects any update whose end state leaves the
-				// timestamps in an inconsistent state. We also re-run the
-				// hierarchy time-containment axiom (axiom 3) here because
-				// per-field axiom checks defer for partial-zero intermediate
-				// states.
+				// caller can flip a lot to/from non-expiring (timestamps) or
+				// to/from unbounded storage (dedicated_GB/opportunistic_GB)
+				// atomically; this final pass rejects any update whose end
+				// state leaves the timestamps or storage axis in an
+				// inconsistent state. We also re-run the hierarchy axioms
+				// here because per-field axiom checks defer for partial
+				// intermediate states.
 				auto &storage_check = lotman::db::StorageManager::get_storage();
 				auto mpa_final = storage_check.get_pointer<lotman::db::ManagementPolicyAttributes>(
 					update_JSON_obj["lot_name"].get<std::string>());
@@ -382,8 +383,26 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 								"' rejected: " + inv_rp.second;
 					return false;
 				}
+				auto mpa_inv_rp = lotman::validate_mpa_invariants(mpa_final->dedicated_GB, mpa_final->opportunistic_GB,
+																  mpa_final->max_num_objects);
+				if (!mpa_inv_rp.first) {
+					txn_error = "Update on lot '" + update_JSON_obj["lot_name"].get<std::string>() +
+								"' rejected: " + mpa_inv_rp.second;
+					return false;
+				}
 				if (lotman::Context::get_strict_hierarchy()) {
-					auto a3 = lotman::Lot::validate_axiom3(update_JSON_obj["lot_name"].get<std::string>());
+					const std::string &final_name = update_JSON_obj["lot_name"].get<std::string>();
+					auto a1 = lotman::Lot::validate_axiom1(final_name);
+					if (!a1.first) {
+						txn_error = a1.second;
+						return false;
+					}
+					auto a2 = lotman::Lot::validate_axiom2_for_parents_of(final_name);
+					if (!a2.first) {
+						txn_error = a2.second;
+						return false;
+					}
+					auto a3 = lotman::Lot::validate_axiom3(final_name);
 					if (!a3.first) {
 						txn_error = a3.second;
 						return false;
