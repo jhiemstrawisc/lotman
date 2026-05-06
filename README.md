@@ -29,6 +29,19 @@ Lot objects are comprised of several components:
     - *Dedicated GB* -- The amount of storage made available to the lot owner. Owners who stay within this limit should be guaranteed this amount of storage while the lot is still viable.
     - *Opportunistic GB* -- Once a lot has used its entire allotment of dedicated storage, data is counted toward its opportunistic storage. Similar to expired lots, a system *may* make opportunistic storage available to the lot when resources are abundant. However, because LotMan intentionally does not track which paths associated with a lot are tied to different types of storage, when a system must make space, it must make a decision about which files from the lot are to be deleted. For this reason, exceeding dedicated storage limits should be treated as making any portion of the lot's associated data transient.
     - *Max Objects* -- The maximum number of objects a lot can store.
+
+      **Unbounded MPAs (sentinel `0`):** Just as the timestamp axis uses `0` to mean "non-expiring", each *resource* axis uses `0` to mean "no bound on this axis". The resource MPAs are grouped into two independent axes:
+
+      - *Storage axis* -- `dedicated_GB` together with `opportunistic_GB`. The storage axis is unbounded **iff both** values are `0`. Because opportunistic storage is meaningful only relative to a finite dedicated allotment, the combination `dedicated_GB == 0` with `opportunistic_GB > 0` is rejected outright (an unbounded base capacity makes a finite burst cap meaningless). The combination `dedicated_GB > 0` with `opportunistic_GB == 0` is allowed and simply means "no burst capacity".
+      - *Object axis* -- `max_num_objects`. The object axis is unbounded **iff** `max_num_objects == 0`.
+
+      The two resource axes (and the timestamp axis) are independent: a lot may be unbounded on storage while still capping objects, or vice versa. An unbounded axis:
+
+        - is excluded from the corresponding `lotman_get_lots_past_*` query (an unbounded lot can never be "past quota" on that axis), and reports the matching `available_*` field as `null` from `lotman_get_available_capacity`;
+        - under `strict_hierarchy`, is treated as `+∞` on that axis only: an unbounded parent absorbs any finite child allocation on that axis (Axioms 1 and 2 skip per-axis cap checks against an unbounded parent), but an unbounded child requires **every** parent to also be unbounded on that axis. Bounds on other axes are still enforced normally.
+
+      To flip an existing lot to or from unbounded storage, supply both `dedicated_GB` and `opportunistic_GB` in the same `lotman_update_lot` envelope; the per-field axiom checks tolerate the transient partial state inside the transaction and a final post-update invariant pass enforces the storage-axis consistency rule, rolling back any partial flip that would leave the lot in the rejected `(dedicated_GB == 0, opportunistic_GB > 0)` state.
+
 - **Usage Statistics:** Several usage statistics can be tracked for each lot. They are:
     - *Self GB* -- The number of GB a lot is currently using, not including those of its children.
     - *Children GB* -- The cumulative number of GB being used by all of a lot's children, not including itself in cases where a lot is a self parent.
@@ -47,8 +60,8 @@ LotMan supports a *reservation* model in which a parent lot's resources (dedicat
 These are set with `lotman_set_context_str` and read with `lotman_get_context_str`:
 
 - **`strict_hierarchy`** (`"true"` / `"false"`, default `"false"`) -- When enabled, every operation that creates or mutates a lot is validated against the following axioms before it is committed; failure rolls the change back atomically:
-    1. **Axiom 1** -- A child's MPAs may not exceed the sum of its parents' attributions to it.
-    2. **Axiom 2** -- For any parent, the *peak concurrent* attributed usage across its children (over their active time windows) must not exceed the parent's own MPAs. This is checked with a sweep-line algorithm over the children's `[creation_time, expiration_time)` intervals so that two children whose windows don't overlap can both reserve the same capacity.
+    1. **Axiom 1** -- A child's MPAs may not exceed the sum of its parents' attributions to it. Each resource axis (storage = `dedicated_GB`+`opportunistic_GB`, objects = `max_num_objects`) is checked independently; an unbounded parent on a given axis is treated as `+∞` and disables the cap check for that axis only.
+    2. **Axiom 2** -- For any parent, the *peak concurrent* attributed usage across its children (over their active time windows) must not exceed the parent's own MPAs. This is checked with a sweep-line algorithm over the children's `[creation_time, expiration_time)` intervals so that two children whose windows don't overlap can both reserve the same capacity. The sweep is performed per axis; an axis on which the parent is unbounded is skipped (any concurrent child sum is acceptable on that axis), while bounded axes are still enforced.
     3. **Axiom 3** -- A child's active interval must lie within each of its parents' intervals. The non-expiring sentinel (all timestamps `0`) is treated as the interval `(-∞, +∞)`: a non-expiring parent absorbs any child window, but a non-expiring child requires every parent to also be non-expiring.
 - **`contraction_policy`** (`"none"` / `"strict"`, default `"none"`) -- Controls whether MPAs may be *reduced* on an existing lot. Under `"strict"`, an update that would lower a parent's capacity below what its children have already reserved is rejected.
 - **`admin_override`** (`"true"` / `"false"`, default `"false"`) -- Bypasses contraction-policy restrictions for privileged callers. Strict-hierarchy axioms are still enforced.

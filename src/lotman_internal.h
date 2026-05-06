@@ -46,6 +46,59 @@ inline bool is_non_expiring(int64_t creation_time, int64_t expiration_time, int6
 	return creation_time == 0 && expiration_time == 0 && deletion_time == 0;
 }
 
+// Resource-axis sentinels: a value of 0 on a quota MPA marks that axis as
+// "unbounded". MPAs are grouped into independent axes that are validated
+// internally but treated independently of each other:
+//   * Storage axis: dedicated_GB and opportunistic_GB. The storage axis is
+//     unbounded iff both are 0. Mixing (dedicated_GB == 0 with
+//     opportunistic_GB > 0) is rejected -- if the dedicated capacity is
+//     unbounded, a finite opportunistic cap is meaningless. The reverse
+//     (dedicated_GB > 0 with opportunistic_GB == 0) is allowed and means
+//     the lot has no opportunistic burst capacity.
+//   * Object-count axis: max_num_objects. Unbounded iff 0.
+// Different axes are independent: a lot may be unbounded on one axis and
+// bounded on another.
+inline bool is_unbounded_storage(double dedicated_GB, double opportunistic_GB) {
+	return dedicated_GB == 0.0 && opportunistic_GB == 0.0;
+}
+
+inline bool is_unbounded_objects(int64_t max_num_objects) {
+	return max_num_objects == 0;
+}
+
+// True when the storage axis is in a transient, inconsistent state that can
+// occur mid-transaction during a multi-field update (dedicated_GB has already
+// been set to 0 while opportunistic_GB has not yet been updated to match).
+// Hierarchy validation predicates short-circuit when they encounter this state
+// and rely on a post-loop check in lotman_update_lot to reject any persisting
+// partial state.
+inline bool is_partial_storage_sentinel(double dedicated_GB, double opportunistic_GB) {
+	return dedicated_GB == 0.0 && opportunistic_GB > 0.0;
+}
+
+// Validate the per-axis MPA invariants for a lot:
+//   * All MPAs must be non-negative.
+//   * Storage axis: if dedicated_GB == 0, opportunistic_GB must also be 0.
+// Returns (true, "") when valid, otherwise (false, message).
+inline std::pair<bool, std::string> validate_mpa_invariants(double dedicated_GB, double opportunistic_GB,
+															int64_t max_num_objects) {
+	if (dedicated_GB < 0 || opportunistic_GB < 0 || max_num_objects < 0) {
+		return std::make_pair(false, std::string("MPAs must be non-negative; got dedicated_GB=") +
+										 std::to_string(dedicated_GB) +
+										 ", opportunistic_GB=" + std::to_string(opportunistic_GB) +
+										 ", max_num_objects=" + std::to_string(max_num_objects) + ".");
+	}
+	if (dedicated_GB == 0.0 && opportunistic_GB > 0.0) {
+		return std::make_pair(
+			false, std::string("Storage-axis sentinel violation: when dedicated_GB is 0 (the unbounded sentinel), "
+							   "opportunistic_GB must also be 0. The storage axis must be either fully bounded "
+							   "(dedicated_GB > 0) or fully unbounded (both dedicated_GB and opportunistic_GB equal "
+							   "to 0). Got dedicated_GB=") +
+					   std::to_string(dedicated_GB) + ", opportunistic_GB=" + std::to_string(opportunistic_GB) + ".");
+	}
+	return std::make_pair(true, "");
+}
+
 // Validate the time-field invariants for a lot's MPAs. Enforces:
 //   * If any of creation_time/expiration_time/deletion_time is 0, all three
 //     must be 0 (non-expiring sentinel).

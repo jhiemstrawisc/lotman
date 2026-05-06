@@ -89,6 +89,22 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg);
 			that are using some amount of opp storage may be subject to purging in the event that the system
 			needs to create space.
 		"max_num_objects": An int64 indicating the maxiximum number of objects a lot may have attributed to it.
+
+			Sentinel for unbounded MPAs: a value of 0 on a quota MPA marks that resource axis as
+			unbounded for this lot. MPAs are grouped into independent axes that are validated
+			internally but treated independently of each other:
+			  * Storage axis (dedicated_GB + opportunistic_GB): the axis is unbounded iff BOTH
+				dedicated_GB and opportunistic_GB are 0. Setting dedicated_GB to 0 with
+				opportunistic_GB > 0 is rejected -- if the dedicated capacity is unbounded, a finite
+				opportunistic cap is meaningless. The reverse (dedicated_GB > 0 with
+				opportunistic_GB == 0) is allowed and means the lot has no opportunistic burst
+				capacity.
+			  * Object-count axis (max_num_objects): unbounded iff 0.
+			Different axes are independent: a lot may be unbounded on one axis and bounded on
+			another (e.g. unbounded storage with a finite max_num_objects). Under strict_hierarchy,
+			a child that is unbounded on an axis requires every parent to also be unbounded on that
+			axis; an unbounded parent absorbs any child allocation on that axis. Lots that are
+			unbounded on an axis never appear in past-quota queries for that axis.
 		"creation_time":
 			REQUIRED: A Unix timestamp in milliseconds indicating when the lot should begin its existence.
 			The lot is considered active starting at this time (inclusive). Together with expiration_time,

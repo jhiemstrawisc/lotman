@@ -6424,4 +6424,633 @@ TEST_F(StrictHierarchyTest, NonExpiringLotPathOverlapsAnyOtherLot) {
 	EXPECT_NE(rv, 0) << "Finite lot must conflict with a non-expiring lot on the same path";
 }
 
+// ============================================================================
+// Unbounded MPA sentinel (per-axis 0 == "no bound") tests
+// ============================================================================
+//
+// Resource axes:
+//   * Storage axis: dedicated_GB + opportunistic_GB.
+//     - Unbounded iff BOTH are 0.
+//     - dedicated_GB == 0 with opportunistic_GB > 0 is rejected (an
+//       unbounded base capacity makes a finite opportunistic cap meaningless).
+//     - dedicated_GB > 0 with opportunistic_GB == 0 is allowed (no burst).
+//   * Object axis: max_num_objects.
+//     - Unbounded iff 0.
+// Different axes are independent.
+
+// Add a lot that is unbounded on the storage axis but bounded on objects.
+TEST_F(StrictHierarchyTest, AddLotUnboundedStorageBoundedObjectsSucceeds) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "unbounded_storage",
+		"owner": "owner1",
+		"parents": ["unbounded_storage"],
+		"paths": [{"path": "/unbounded/storage", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 0,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << "Unbounded storage with bounded objects should succeed: "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
+// Add a lot that is unbounded on the object axis but bounded on storage.
+TEST_F(StrictHierarchyTest, AddLotUnboundedObjectsBoundedStorageSucceeds) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "unbounded_objs",
+		"owner": "owner1",
+		"parents": ["unbounded_objs"],
+		"paths": [{"path": "/unbounded/objs", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 50,
+			"max_num_objects": 0,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << "Unbounded objects with bounded storage should succeed: "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
+// Add a lot that is unbounded on every axis.
+TEST_F(StrictHierarchyTest, AddLotFullyUnboundedSucceeds) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "fully_unbounded",
+		"owner": "owner1",
+		"parents": ["fully_unbounded"],
+		"paths": [{"path": "/unbounded/all", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 0,
+			"max_num_objects": 0,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << "Fully unbounded lot should succeed: " << (err.get() ? err.get() : "<no error>");
+}
+
+// dedicated_GB == 0 with opportunistic_GB > 0 must be rejected.
+TEST_F(StrictHierarchyTest, AddLotRejectsZeroDedicatedNonZeroOpportunistic) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "bad_storage",
+		"owner": "owner1",
+		"parents": ["bad_storage"],
+		"paths": [{"path": "/bad/storage", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 50,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_NE(rv, 0) << "dedicated_GB == 0 with opportunistic_GB > 0 must be rejected";
+	std::string err_str(err.get() ? err.get() : "");
+	EXPECT_TRUE(err_str.find("Storage-axis") != std::string::npos || err_str.find("dedicated_GB") != std::string::npos)
+		<< "Error message should mention the storage axis violation; got: " << err_str;
+}
+
+// dedicated_GB > 0 with opportunistic_GB == 0 is fine (no burst).
+TEST_F(StrictHierarchyTest, AddLotZeroOpportunisticOnlySucceeds) {
+	addDefaultLot();
+	char *raw_err = nullptr;
+	int rv = lotman_add_lot(R"({
+		"lot_name": "no_burst",
+		"owner": "owner1",
+		"parents": ["no_burst"],
+		"paths": [{"path": "/no/burst", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 0,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})",
+							&raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << "dedicated_GB > 0 with opportunistic_GB == 0 should be allowed (no burst capacity): "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
+// Strict hierarchy: a parent that is unbounded on the storage axis absorbs
+// any finite child storage allocation.
+TEST_F(StrictHierarchyTest, FiniteChildAllowedUnderUnboundedStorageParentStrict) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "us_parent",
+		"owner": "owner1",
+		"parents": ["us_parent"],
+		"paths": [{"path": "/us/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 0,
+			"max_num_objects": 1000,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	rv = lotman_add_lot(R"({
+		"lot_name": "us_child_finite",
+		"owner": "owner1",
+		"parents": ["us_parent"],
+		"paths": [{"path": "/us/parent/child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1000000,
+			"opportunistic_GB": 1000000,
+			"max_num_objects": 100,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_EQ(rv, 0) << "An unbounded-storage parent must absorb any child storage allocation: "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
+// Strict hierarchy: an unbounded-storage child cannot live under a
+// bounded-storage parent.
+TEST_F(StrictHierarchyTest, UnboundedStorageChildRejectedUnderBoundedStorageParentStrict) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "bs_parent",
+		"owner": "owner1",
+		"parents": ["bs_parent"],
+		"paths": [{"path": "/bs/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 50,
+			"max_num_objects": 1000,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	rv = lotman_add_lot(R"({
+		"lot_name": "bs_child_unbounded",
+		"owner": "owner1",
+		"parents": ["bs_parent"],
+		"paths": [{"path": "/bs/parent/child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 0,
+			"max_num_objects": 100,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_NE(rv, 0) << "An unbounded-storage child cannot live under a bounded-storage parent";
+	std::string err_str(err.get() ? err.get() : "");
+	EXPECT_TRUE(err_str.find("unbounded") != std::string::npos)
+		<< "Error message should mention unbounded; got: " << err_str;
+}
+
+// Object axis is independent of storage axis: a parent unbounded on objects
+// only must still enforce its storage cap.
+TEST_F(StrictHierarchyTest, AxesAreIndependentObjectsUnboundedOnly) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "axis_parent",
+		"owner": "owner1",
+		"parents": ["axis_parent"],
+		"paths": [{"path": "/axis/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 50,
+			"max_num_objects": 0,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	// Unbounded-objects child fits because parent is also unbounded on objects.
+	// But finite storage that exceeds parent's storage axis must fail.
+	rv = lotman_add_lot(R"({
+		"lot_name": "axis_child_bad_storage",
+		"owner": "owner1",
+		"parents": ["axis_parent"],
+		"paths": [{"path": "/axis/parent/c1", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 1000,
+			"opportunistic_GB": 0,
+			"max_num_objects": 0,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_NE(rv, 0) << "Finite storage > parent storage cap must still fail when only the object axis is unbounded";
+
+	// A child whose storage fits and has unbounded objects succeeds.
+	raw_err = nullptr;
+	rv = lotman_add_lot(R"({
+		"lot_name": "axis_child_ok",
+		"owner": "owner1",
+		"parents": ["axis_parent"],
+		"paths": [{"path": "/axis/parent/c2", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 50,
+			"opportunistic_GB": 25,
+			"max_num_objects": 0,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	UniqueCString err2(raw_err);
+	EXPECT_EQ(rv, 0) << "Storage-fitting unbounded-objects child under unbounded-objects parent should succeed: "
+					 << (err2.get() ? err2.get() : "<no error>");
+}
+
+// Strict hierarchy: an unbounded-objects child cannot live under a
+// bounded-objects parent.
+TEST_F(StrictHierarchyTest, UnboundedObjectsChildRejectedUnderBoundedObjectsParentStrict) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "bo_parent",
+		"owner": "owner1",
+		"parents": ["bo_parent"],
+		"paths": [{"path": "/bo/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 50,
+			"max_num_objects": 1000,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	rv = lotman_add_lot(R"({
+		"lot_name": "bo_child_unbounded",
+		"owner": "owner1",
+		"parents": ["bo_parent"],
+		"paths": [{"path": "/bo/parent/child", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 50,
+			"opportunistic_GB": 25,
+			"max_num_objects": 0,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_NE(rv, 0) << "An unbounded-objects child cannot live under a bounded-objects parent";
+	std::string err_str(err.get() ? err.get() : "");
+	EXPECT_TRUE(err_str.find("unbounded") != std::string::npos || err_str.find("max_num_objects") != std::string::npos)
+		<< "Error should mention unbounded/max_num_objects; got: " << err_str;
+}
+
+// Sweep line: a parent unbounded on the storage axis allows the sum of
+// concurrently-active children's attributed storage to exceed any finite
+// number.
+TEST_F(StrictHierarchyTest, SweepLineUnboundedStorageParentAllowsAnyChildSum) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "sw_unb_parent",
+		"owner": "owner1",
+		"parents": ["sw_unb_parent"],
+		"paths": [{"path": "/sw/unb", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 0,
+			"max_num_objects": 1000,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	// Two large overlapping children both "exceed" any finite cap on storage.
+	for (const char *child : {R"({
+			"lot_name": "sw_unb_c1",
+			"owner": "owner1",
+			"parents": ["sw_unb_parent"],
+			"paths": [{"path": "/sw/unb/c1", "recursive": true}],
+			"management_policy_attrs": {
+				"dedicated_GB": 5000, "opportunistic_GB": 5000, "max_num_objects": 100,
+				"creation_time": 200, "expiration_time": 8000, "deletion_time": 9000
+			}
+		})",
+							  R"({
+			"lot_name": "sw_unb_c2",
+			"owner": "owner1",
+			"parents": ["sw_unb_parent"],
+			"paths": [{"path": "/sw/unb/c2", "recursive": true}],
+			"management_policy_attrs": {
+				"dedicated_GB": 5000, "opportunistic_GB": 5000, "max_num_objects": 100,
+				"creation_time": 300, "expiration_time": 8500, "deletion_time": 9000
+			}
+		})"}) {
+		raw_err = nullptr;
+		rv = lotman_add_lot(child, &raw_err);
+		UniqueCString cerr(raw_err);
+		EXPECT_EQ(rv, 0) << "Child should succeed under unbounded-storage parent: "
+						 << (cerr.get() ? cerr.get() : "<no error>");
+	}
+}
+
+// Sweep line: a bounded parent still rejects an over-allocation when only
+// the object axis is unbounded.
+TEST_F(StrictHierarchyTest, SweepLineBoundedStorageRejectsOverAllocationDespiteUnboundedObjects) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "sw_mix_parent",
+		"owner": "owner1",
+		"parents": ["sw_mix_parent"],
+		"paths": [{"path": "/sw/mix", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": 0,
+			"max_num_objects": 0,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	// First child takes 60 GB during [200, 8000).
+	rv = lotman_add_lot(R"({
+		"lot_name": "sw_mix_c1",
+		"owner": "owner1",
+		"parents": ["sw_mix_parent"],
+		"paths": [{"path": "/sw/mix/c1", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 60, "opportunistic_GB": 0, "max_num_objects": 0,
+			"creation_time": 200, "expiration_time": 8000, "deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	UniqueCString err1(raw_err);
+	ASSERT_EQ(rv, 0) << "First child should fit: " << (err1.get() ? err1.get() : "<no error>");
+
+	// Second child takes 50 GB during [300, 7000), overlapping the first;
+	// concurrent peak = 110 GB > parent cap of 100 GB.
+	raw_err = nullptr;
+	rv = lotman_add_lot(R"({
+		"lot_name": "sw_mix_c2",
+		"owner": "owner1",
+		"parents": ["sw_mix_parent"],
+		"paths": [{"path": "/sw/mix/c2", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 50, "opportunistic_GB": 0, "max_num_objects": 0,
+			"creation_time": 300, "expiration_time": 7000, "deletion_time": 9000
+		}
+	})",
+						&raw_err);
+	UniqueCString err2(raw_err);
+	EXPECT_NE(rv, 0) << "Concurrent children must not exceed bounded storage axis even when objects are unbounded";
+}
+
+// Sweep line: a non-expiring child that is unbounded on storage under a
+// non-expiring, unbounded-storage parent is accepted (worst case combined
+// with finite siblings).
+TEST_F(StrictHierarchyTest, SweepLineNonExpiringUnboundedChildUnderNonExpiringUnboundedParent) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "ne_unb_parent",
+		"owner": "owner1",
+		"parents": ["ne_unb_parent"],
+		"paths": [{"path": "/ne/unb/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0, "opportunistic_GB": 0, "max_num_objects": 0,
+			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << err.get();
+
+	// A non-expiring child unbounded on every axis under a non-expiring
+	// unbounded parent: must succeed.
+	rv = lotman_add_lot(R"({
+		"lot_name": "ne_unb_child",
+		"owner": "owner1",
+		"parents": ["ne_unb_parent"],
+		"paths": [{"path": "/ne/unb/parent/c", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0, "opportunistic_GB": 0, "max_num_objects": 0,
+			"creation_time": 0, "expiration_time": 0, "deletion_time": 0
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_EQ(rv, 0) << "Non-expiring fully-unbounded child under non-expiring fully-unbounded parent should succeed: "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
+// Past-quota query: an unbounded-storage lot is never returned from
+// lotman_get_lots_past_ded / past_opp.
+TEST_F(StrictHierarchyTest, UnboundedStorageLotNotReturnedFromPastDedQuery) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "pq_unbounded",
+		"owner": "owner1",
+		"parents": ["pq_unbounded"],
+		"paths": [{"path": "/pq/unb", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 0, "opportunistic_GB": 0, "max_num_objects": 100,
+			"creation_time": 100, "expiration_time": 9000, "deletion_time": 9500
+		}
+	})");
+
+	// Push self_GB very high; an unbounded-storage lot can never be "past"
+	// its dedicated quota.
+	const char *usage_json = R"({
+		"lot_name": "pq_unbounded",
+		"self_GB": 999999.0
+	})";
+	char *raw_err = nullptr;
+	int rv = lotman_update_lot_usage(usage_json, false, &raw_err);
+	UniqueCString uerr(raw_err);
+	ASSERT_EQ(rv, 0) << "Failed to set usage: " << (uerr.get() ? uerr.get() : "<no error>");
+
+	char **lots = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lots_past_ded(false, false, &lots, false, &raw_err);
+	UniqueCString perr(raw_err);
+	ASSERT_EQ(rv, 0) << "lotman_get_lots_past_ded failed: " << (perr.get() ? perr.get() : "<no error>");
+	bool found = false;
+	if (lots) {
+		for (size_t i = 0; lots[i] != nullptr; ++i) {
+			if (std::string(lots[i]) == "pq_unbounded")
+				found = true;
+		}
+		lotman_free_string_list(lots);
+	}
+	EXPECT_FALSE(found) << "An unbounded-storage lot must never appear in past-dedicated-quota queries";
+}
+
+// Past-quota query: an unbounded-objects lot is never returned from
+// lotman_get_lots_past_obj.
+TEST_F(StrictHierarchyTest, UnboundedObjectsLotNotReturnedFromPastObjQuery) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "pq_unb_obj",
+		"owner": "owner1",
+		"parents": ["pq_unb_obj"],
+		"paths": [{"path": "/pq/unb/obj", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100, "opportunistic_GB": 0, "max_num_objects": 0,
+			"creation_time": 100, "expiration_time": 9000, "deletion_time": 9500
+		}
+	})");
+
+	const char *usage_json = R"({
+		"lot_name": "pq_unb_obj",
+		"self_objects": 999999
+	})";
+	char *raw_err = nullptr;
+	int rv = lotman_update_lot_usage(usage_json, false, &raw_err);
+	UniqueCString uerr(raw_err);
+	ASSERT_EQ(rv, 0) << "Failed to set usage: " << (uerr.get() ? uerr.get() : "<no error>");
+
+	char **lots = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lots_past_obj(false, false, &lots, false, &raw_err);
+	UniqueCString perr(raw_err);
+	ASSERT_EQ(rv, 0) << "lotman_get_lots_past_obj failed: " << (perr.get() ? perr.get() : "<no error>");
+	bool found = false;
+	if (lots) {
+		for (size_t i = 0; lots[i] != nullptr; ++i) {
+			if (std::string(lots[i]) == "pq_unb_obj")
+				found = true;
+		}
+		lotman_free_string_list(lots);
+	}
+	EXPECT_FALSE(found) << "An unbounded-objects lot must never appear in past-object-quota queries";
+}
+
+// Atomic flip via lotman_update_lot: set both dedicated_GB and
+// opportunistic_GB to 0 in one envelope.
+TEST_F(StrictHierarchyTest, UpdateLotToUnboundedStorageIsAtomic) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "flip_target",
+		"owner": "owner1",
+		"parents": ["flip_target"],
+		"paths": [{"path": "/flip/target", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100, "opportunistic_GB": 50, "max_num_objects": 100,
+			"creation_time": 100, "expiration_time": 9000, "deletion_time": 9500
+		}
+	})");
+	char *raw_err = nullptr;
+	int rv = lotman_update_lot(R"({
+		"lot_name": "flip_target",
+		"management_policy_attrs": {
+			"dedicated_GB": 0,
+			"opportunistic_GB": 0
+		}
+	})",
+							   &raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_EQ(rv, 0) << "Atomic flip to unbounded storage should succeed: " << (err.get() ? err.get() : "<no error>");
+}
+
+// Atomic flip via lotman_update_lot: a partial flip leaving the storage
+// axis in (dedicated_GB == 0, opportunistic_GB > 0) must be rejected and
+// rolled back.
+TEST_F(StrictHierarchyTest, UpdateLotPartialStorageFlipRejectedAndRolledBack) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "partial_flip",
+		"owner": "owner1",
+		"parents": ["partial_flip"],
+		"paths": [{"path": "/partial/flip", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100, "opportunistic_GB": 50, "max_num_objects": 100,
+			"creation_time": 100, "expiration_time": 9000, "deletion_time": 9500
+		}
+	})");
+
+	// Try to set only dedicated_GB to 0 (leaving opportunistic_GB at 50).
+	char *raw_err = nullptr;
+	int rv = lotman_update_lot(R"({
+		"lot_name": "partial_flip",
+		"management_policy_attrs": {
+			"dedicated_GB": 0
+		}
+	})",
+							   &raw_err);
+	UniqueCString err(raw_err);
+	EXPECT_NE(rv, 0) << "Partial storage flip (dedicated_GB == 0 with opportunistic_GB > 0) must be rejected";
+
+	// Confirm rollback: original values still present.
+	char *out = nullptr;
+	raw_err = nullptr;
+	rv = lotman_get_lot_as_json("partial_flip", false, &out, &raw_err);
+	UniqueCString gerr(raw_err);
+	UniqueCString out_owned(out);
+	ASSERT_EQ(rv, 0) << "Failed to read back lot: " << (gerr.get() ? gerr.get() : "<no error>");
+	json parsed = json::parse(out_owned.get());
+	EXPECT_DOUBLE_EQ(parsed["management_policy_attrs"]["dedicated_GB"].get<double>(), 100.0);
+	EXPECT_DOUBLE_EQ(parsed["management_policy_attrs"]["opportunistic_GB"].get<double>(), 50.0);
+}
+
 } // namespace
