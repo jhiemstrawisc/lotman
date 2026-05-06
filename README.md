@@ -37,7 +37,7 @@ Lot objects are comprised of several components:
 
       The two resource axes (and the timestamp axis) are independent: a lot may be unbounded on storage while still capping objects, or vice versa. An unbounded axis:
 
-        - is excluded from the corresponding `lotman_get_lots_past_*` query (an unbounded lot can never be "past quota" on that axis), and reports the matching `available_*` field as `null` from `lotman_get_lot_capacity`;
+        - is excluded from the corresponding `lotman_get_lots_past_*` query (an unbounded lot can never be "past quota" on that axis), and reports the matching `available_*` field as `null` from `lotman_get_available_capacity`;
         - under `strict_hierarchy`, is treated as `+∞` on that axis only: an unbounded parent absorbs any finite child allocation on that axis (Axioms 1 and 2 skip per-axis cap checks against an unbounded parent), but an unbounded child requires **every** parent to also be unbounded on that axis. Bounds on other axes are still enforced normally.
 
       To flip an existing lot to or from unbounded storage, supply both `dedicated_GB` and `opportunistic_GB` in the same `lotman_update_lot` envelope; the per-field axiom checks tolerate the transient partial state inside the transaction and a final post-update invariant pass enforces the storage-axis consistency rule, rolling back any partial flip that would leave the lot in the rejected `(dedicated_GB == 0, opportunistic_GB > 0)` state.

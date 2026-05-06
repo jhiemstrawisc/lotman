@@ -67,10 +67,10 @@ inline bool is_unbounded_objects(int64_t max_num_objects) {
 }
 
 // True when the storage axis is in a transient, inconsistent state that can
-// occur mid-transaction during a multi-field update (dedicated_GB == 0 with
-// opportunistic_GB still > 0, or vice versa during an atomic flip). Hierarchy
-// validation predicates short-circuit when they encounter this state and
-// rely on a post-loop check in lotman_update_lot to reject any persisting
+// occur mid-transaction during a multi-field update (dedicated_GB has already
+// been set to 0 while opportunistic_GB has not yet been updated to match).
+// Hierarchy validation predicates short-circuit when they encounter this state
+// and rely on a post-loop check in lotman_update_lot to reject any persisting
 // partial state.
 inline bool is_partial_storage_sentinel(double dedicated_GB, double opportunistic_GB) {
 	return dedicated_GB == 0.0 && opportunistic_GB > 0.0;
