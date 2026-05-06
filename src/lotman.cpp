@@ -1735,6 +1735,22 @@ int lotman_get_lot_as_json(const char *lot_name, const bool recursive, char **ou
 		}
 		output_obj["usage"] = internal_usage_obj;
 
+		// Add per-parent attributions. Always emitted (as an object, possibly
+		// empty) so callers can round-trip create-then-read and audit the
+		// attribution graph. Self-parent-only lots simply produce {}.
+		{
+			auto rp_attr = lot.get_parent_attributions();
+			if (!rp_attr.second.empty()) {
+				if (err_msg) {
+					std::string int_err = rp_attr.second;
+					std::string ext_err = "Failure on call to get_parent_attributions: ";
+					*err_msg = strdup((ext_err + int_err).c_str());
+				}
+				return -1;
+			}
+			output_obj["parent_attributions"] = rp_attr.first;
+		}
+
 		// Copy the object to output
 		std::string output_str = output_obj.dump();
 		auto output_str_c = static_cast<char *>(malloc(sizeof(char) * (output_str.length() + 1)));

@@ -289,6 +289,14 @@ class Lot {
 
 	std::pair<json, std::string> get_lot_usage(const std::string &key, const bool recursive);
 
+	// Returns the per-parent attributions for this lot as a JSON object of the
+	// form {parent_name: {dedicated_GB: <value>, opportunistic_GB: <value>,
+	// max_num_objects: <int>}}. Values are the absolute MPA shares (fraction *
+	// child MPA), so they round-trip with the input accepted by lotman_add_lot.
+	// Unbounded child axes (-1 sentinel) propagate to each parent as -1.
+	// Returns an empty object for self-parented lots with no non-self parents.
+	std::pair<json, std::string> get_parent_attributions();
+
 	std::pair<bool, std::string> add_parents(const std::vector<Lot> &parents);
 	std::pair<bool, std::string> add_paths(const std::vector<json> &paths);
 

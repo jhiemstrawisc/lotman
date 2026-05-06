@@ -1481,6 +1481,10 @@ TEST_F(LotManTest, GetLotJSONTest) {
 			"lot2",
 			"sep_node"
 		],
+		"parent_attributions": {
+			"lot2":     {"dedicated_GB": 5.0555, "opportunistic_GB": 3.3, "max_num_objects": 25},
+			"sep_node": {"dedicated_GB": 5.0555, "opportunistic_GB": 3.3, "max_num_objects": 25}
+		},
 		"paths": [
 			{
 				"exclude": false,
@@ -1542,6 +1546,10 @@ TEST_F(LotManTest, GetLotJSONTest) {
 			"lot2",
 			"sep_node"
 		],
+		"parent_attributions": {
+			"lot2":     {"dedicated_GB": 5.0555, "opportunistic_GB": 3.3, "max_num_objects": 25},
+			"sep_node": {"dedicated_GB": 5.0555, "opportunistic_GB": 3.3, "max_num_objects": 25}
+		},
 		"paths": [
 			{
 				"exclude": false,

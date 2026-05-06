@@ -7643,4 +7643,93 @@ TEST_F(StrictHierarchyTest, ParentAttributionsAcceptsUnboundedSentinel) {
 					 << (err.get() ? err.get() : "<no error>");
 }
 
+// Regression: lotman_get_lot_as_json must serialize parent_attributions so
+// that callers can read back per-parent MPA shares (the data is in the DB
+// but was previously omitted from the JSON envelope, breaking round-trip
+// audit/diff and any in-process integration test of nested-lot creation).
+TEST_F(StrictHierarchyTest, GetLotAsJsonSerializesParentAttributions) {
+	addDefaultLot();
+
+	addLot(R"({
+		"lot_name": "ga_parent",
+		"owner": "owner1",
+		"parents": ["ga_parent"],
+		"paths": [{"path": "/ga/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "<no error>");
+
+	// Child explicitly attributes 50 GB dedicated, -1 (unbounded) on the other axes.
+	rv = lotman_add_lot(R"({
+		"lot_name": "ga_child",
+		"owner": "owner1",
+		"parents": ["ga_parent"],
+		"paths": [{"path": "/ga/parent/c", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 50,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		},
+		"parent_attributions": {
+			"ga_parent": {
+				"dedicated_GB": 50,
+				"opportunistic_GB": -1,
+				"max_num_objects": -1
+			}
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	ASSERT_EQ(rv, 0) << "child create should succeed: " << (err.get() ? err.get() : "<no error>");
+
+	char *out = nullptr;
+	rv = lotman_get_lot_as_json("ga_child", false, &out, &raw_err);
+	UniqueCString gerr(raw_err);
+	ASSERT_EQ(rv, 0) << "get_lot_as_json failed: " << (gerr.get() ? gerr.get() : "<no error>");
+	ASSERT_NE(out, nullptr);
+
+	std::string out_str(out);
+	free(out);
+	auto parsed = nlohmann::json::parse(out_str);
+
+	ASSERT_TRUE(parsed.contains("parent_attributions"))
+		<< "lotman_get_lot_as_json must include parent_attributions: " << parsed.dump();
+	ASSERT_TRUE(parsed["parent_attributions"].contains("ga_parent"))
+		<< "parent_attributions must contain key for non-self parent: " << parsed["parent_attributions"].dump();
+
+	const auto &pa = parsed["parent_attributions"]["ga_parent"];
+	EXPECT_DOUBLE_EQ(pa["dedicated_GB"].get<double>(), 50.0);
+	EXPECT_DOUBLE_EQ(pa["opportunistic_GB"].get<double>(), -1.0)
+		<< "unbounded sentinel must round-trip rather than being emitted as fraction*-1";
+	EXPECT_EQ(pa["max_num_objects"].get<int64_t>(), -1)
+		<< "unbounded sentinel must round-trip rather than being emitted as fraction*-1";
+
+	// A self-parent-only lot has no non-self parents, so parent_attributions
+	// must still be present but empty (so consumers can rely on the key
+	// always existing).
+	out = nullptr;
+	rv = lotman_get_lot_as_json("ga_parent", false, &out, &raw_err);
+	UniqueCString perr(raw_err);
+	ASSERT_EQ(rv, 0) << (perr.get() ? perr.get() : "<no error>");
+	auto parent_parsed = nlohmann::json::parse(out);
+	free(out);
+	ASSERT_TRUE(parent_parsed.contains("parent_attributions"));
+	EXPECT_TRUE(parent_parsed["parent_attributions"].is_object());
+	EXPECT_TRUE(parent_parsed["parent_attributions"].empty());
+}
+
 } // namespace
