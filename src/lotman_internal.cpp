@@ -3178,9 +3178,18 @@ std::pair<bool, std::string> lotman::Lot::check_contraction_for_deletion(const s
 	}
 
 	if (contraction_policy == "always") {
-		return std::make_pair(false,
-							  "Contraction policy 'always' blocks deletion of lot '" + lot_name +
-								  "'. Deletion is treated as contraction to zero. Set admin_override to bypass.");
+		// Expired lots are deletable by the appropriate caller without admin_override.
+		// Only alive (non-expired) lots require admin_override under the "always" policy.
+		auto alive_rp = is_lot_alive(lot_name);
+		if (!alive_rp.second.empty()) {
+			return std::make_pair(false,
+								  std::string("Failed contraction policy check for deletion: ") + alive_rp.second);
+		}
+		if (alive_rp.first) {
+			return std::make_pair(false,
+								  "Contraction policy 'always' blocks deletion of lot '" + lot_name +
+									  "'. Deletion is treated as contraction to zero. Set admin_override to bypass.");
+		}
 	}
 
 	if (contraction_policy == "alive") {

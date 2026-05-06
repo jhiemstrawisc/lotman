@@ -1452,6 +1452,8 @@ TEST_F(StrictHierarchyTest, ContractionBypassedWithAdminOverride) {
 
 TEST_F(StrictHierarchyTest, ContractionBlocksDeletionAlwaysPolicy) {
 	addDefaultLot();
+	// Use a far-future expiration_time so the lot is alive at test time.
+	// The 'always' policy should block deletion of alive lots.
 	addLot(R"({
 		"lot_name": "del_always",
 		"owner": "owner1",
@@ -1461,9 +1463,9 @@ TEST_F(StrictHierarchyTest, ContractionBlocksDeletionAlwaysPolicy) {
 			"dedicated_GB": 50,
 			"opportunistic_GB": 25,
 			"max_num_objects": 500,
-			"creation_time": 100,
-			"expiration_time": 9000,
-			"deletion_time": 9500
+			"creation_time": 1,
+			"expiration_time": 99999999999999,
+			"deletion_time": 99999999999999
 		}
 	})");
 
@@ -1474,9 +1476,41 @@ TEST_F(StrictHierarchyTest, ContractionBlocksDeletionAlwaysPolicy) {
 
 	rv = lotman_remove_lots_recursive("del_always", &raw_err);
 	err.reset(raw_err);
-	EXPECT_NE(rv, 0) << "Lot deletion should be blocked by 'always' contraction policy";
+	EXPECT_NE(rv, 0) << "Deletion of an alive lot should be blocked by 'always' contraction policy";
 	std::string err_str(err.get() ? err.get() : "");
 	EXPECT_TRUE(err_str.find("always") != std::string::npos) << "Error: " << err_str;
+}
+
+TEST_F(StrictHierarchyTest, ExpiredLotDeletableWithoutAdminOverrideUnderAlwaysPolicy) {
+	addDefaultLot();
+	// Lot whose expiration_time is in the distant past — it is expired.
+	addLot(R"({
+		"lot_name": "del_expired",
+		"owner": "owner1",
+		"parents": ["del_expired"],
+		"paths": [{"path": "/del_expired/data", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 50,
+			"opportunistic_GB": 25,
+			"max_num_objects": 500,
+			"creation_time": 1,
+			"expiration_time": 2,
+			"deletion_time": 3
+		}
+	})");
+
+	char *raw_err = nullptr;
+	// Use the most restrictive contraction policy without admin_override.
+	int rv = lotman_set_context_str("contraction_policy", "always", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0);
+
+	// The lot is expired, so the appropriate caller should be able to delete it
+	// without needing admin_override, even under the 'always' contraction policy.
+	rv = lotman_remove_lots_recursive("del_expired", &raw_err);
+	err.reset(raw_err);
+	EXPECT_EQ(rv, 0) << "Expired lot should be deletable without admin_override under 'always' policy: "
+					 << (err.get() ? err.get() : "");
 }
 
 // ============================================================================
