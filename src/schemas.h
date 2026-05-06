@@ -15,16 +15,19 @@ const json parent_attributions_def = R"({
         "additionalProperties": false,
         "properties": {
             "dedicated_GB": {
+                "description": "Dedicated GB attributed from this parent. -1 propagates the unbounded sentinel from the parent on the dedicated axis.",
                 "type": "number",
-                "minimum": 0
+                "minimum": -1
             },
             "opportunistic_GB": {
+                "description": "Opportunistic GB attributed from this parent. -1 propagates the unbounded sentinel from the parent on the opportunistic axis.",
                 "type": "number",
-                "minimum": 0
+                "minimum": -1
             },
             "max_num_objects": {
+                "description": "Object count attributed from this parent. -1 propagates the unbounded sentinel from the parent on the object axis.",
                 "type": "number",
-                "minimum": 0,
+                "minimum": -1,
                 "multipleOf": 1
             }
         }
