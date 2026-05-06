@@ -113,11 +113,18 @@ std::vector<SweepEvent> build_attribution_events(const std::string &parent_lot_n
 									 parent_lot_name + "'");
 		}
 
-		double attr_ded =
-			fractions.count("dedicated_GB") ? fractions.at("dedicated_GB") * child_mpa->dedicated_GB : 0.0;
+		// Guard sentinel values: treat unbounded axes (value == -1) as contributing
+		// 0 to the sweep line.  Callers that only care about bounded axes (e.g.
+		// validate_axiom2, get_available_capacity) already short-circuit via the
+		// parent_unb_* flags, so an unbounded child never corrupts a cap check.
+		double attr_ded = (!is_unbounded_dedicated(child_mpa->dedicated_GB) && fractions.count("dedicated_GB"))
+							  ? fractions.at("dedicated_GB") * child_mpa->dedicated_GB
+							  : 0.0;
 		double attr_opp =
-			fractions.count("opportunistic_GB") ? fractions.at("opportunistic_GB") * child_mpa->opportunistic_GB : 0.0;
-		double attr_obj = fractions.count("max_num_objects")
+			(!is_unbounded_opportunistic(child_mpa->opportunistic_GB) && fractions.count("opportunistic_GB"))
+				? fractions.at("opportunistic_GB") * child_mpa->opportunistic_GB
+				: 0.0;
+		double attr_obj = (!is_unbounded_objects(child_mpa->max_num_objects) && fractions.count("max_num_objects"))
 							  ? std::round(fractions.at("max_num_objects") * child_mpa->max_num_objects)
 							  : 0.0;
 
@@ -847,16 +854,19 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 			std::string rec_ded_usage_query =
 				"SELECT "
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN lot_usage.self_GB + lot_usage.children_GB "
 				"WHEN lot_usage.self_GB + lot_usage.children_GB <= management_policy_attributes.dedicated_GB THEN "
 				"lot_usage.self_GB + lot_usage.children_GB "
 				"ELSE management_policy_attributes.dedicated_GB "
 				"END AS total, " // For readability, not actually referencing these column names
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN lot_usage.self_GB "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN "
 				"management_policy_attributes.dedicated_GB "
 				"ELSE lot_usage.self_GB "
 				"END AS self_contrib, "
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN lot_usage.children_GB "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN '0' "
 				"WHEN lot_usage.self_GB + lot_usage.children_GB >= management_policy_attributes.dedicated_GB THEN "
 				"management_policy_attributes.dedicated_GB - lot_usage.self_GB "
@@ -883,6 +893,7 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 			std::string ded_GB_query =
 				"SELECT "
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN lot_usage.self_GB "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN "
 				"management_policy_attributes.dedicated_GB "
 				"ELSE lot_usage.self_GB "
@@ -912,6 +923,10 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 			std::string rec_opp_usage_query =
 				"SELECT "
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN '0' "
+				"WHEN management_policy_attributes.opportunistic_GB = -1 THEN "
+				"CASE WHEN lot_usage.self_GB + lot_usage.children_GB > management_policy_attributes.dedicated_GB THEN "
+				"lot_usage.self_GB + lot_usage.children_GB - management_policy_attributes.dedicated_GB ELSE '0' END "
 				"WHEN lot_usage.self_GB + lot_usage.children_GB >= management_policy_attributes.opportunistic_GB "
 				"+management_policy_attributes.dedicated_GB THEN management_policy_attributes.opportunistic_GB "
 				"WHEN lot_usage.self_GB + lot_usage.children_GB >= management_policy_attributes.dedicated_GB THEN "
@@ -919,6 +934,10 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 				"ELSE '0' "
 				"END AS total, "
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN '0' "
+				"WHEN management_policy_attributes.opportunistic_GB = -1 THEN "
+				"CASE WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN "
+				"lot_usage.self_GB - management_policy_attributes.dedicated_GB ELSE '0' END "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.opportunistic_GB + "
 				"management_policy_attributes.dedicated_GB THEN management_policy_attributes.opportunistic_GB "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN  lot_usage.self_GB - "
@@ -926,6 +945,12 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 				"ELSE '0' "
 				"END AS self_contrib, "
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN '0' "
+				"WHEN management_policy_attributes.opportunistic_GB = -1 THEN "
+				"CASE WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN lot_usage.children_GB "
+				"WHEN lot_usage.self_GB + lot_usage.children_GB > management_policy_attributes.dedicated_GB THEN "
+				"lot_usage.self_GB + lot_usage.children_GB - management_policy_attributes.dedicated_GB "
+				"ELSE '0' END "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.opportunistic_GB + "
 				"management_policy_attributes.dedicated_GB THEN '0' "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB AND lot_usage.self_GB + "
@@ -965,9 +990,13 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 			std::string opp_GB_query =
 				"SELECT "
 				"CASE "
+				"WHEN management_policy_attributes.dedicated_GB = -1 THEN '0' "
+				"WHEN management_policy_attributes.opportunistic_GB = -1 THEN "
+				"CASE WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN "
+				"lot_usage.self_GB - management_policy_attributes.dedicated_GB ELSE '0' END "
 				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB + "
 				"management_policy_attributes.opportunistic_GB THEN management_policy_attributes.opportunistic_GB "
-				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN lot_usage.self_GB = "
+				"WHEN lot_usage.self_GB >= management_policy_attributes.dedicated_GB THEN lot_usage.self_GB - "
 				"management_policy_attributes.dedicated_GB "
 				"ELSE '0' "
 				"END AS total "
@@ -1142,8 +1171,9 @@ std::pair<json, std::string> lotman::Lot::get_lot_usage(const std::string &key, 
 }
 
 // Non-transactional helper: reloads parents and MPAs from DB, clears old attributions,
-// recomputes with equal split, and validates axioms. Caller MUST hold an active transaction.
-bool lotman::Lot::reload_and_recompute_attributions(std::string &txn_error) {
+// recomputes with the supplied per-parent shares (equal split for any unspecified
+// parent), and validates axioms. Caller MUST hold an active transaction.
+bool lotman::Lot::reload_and_recompute_attributions(std::string &txn_error, const json &parent_attributions_json) {
 	try {
 		auto &storage = db::StorageManager::get_storage();
 		using namespace sqlite_orm;
@@ -1165,10 +1195,12 @@ bool lotman::Lot::reload_and_recompute_attributions(std::string &txn_error) {
 		man_policy_attr.opportunistic_GB = mpa_ptr->opportunistic_GB;
 		man_policy_attr.max_num_objects = mpa_ptr->max_num_objects;
 
-		// Clear old attributions and recompute with equal split
+		// Clear old attributions and recompute, honoring any explicit per-parent
+		// shares supplied by the caller; remaining parents get an equal split of
+		// the remainder.
 		storage.remove_all<db::ParentChildAttribution>(
 			where(c(&db::ParentChildAttribution::child_lot_name) == lot_name));
-		auto attr_rp = compute_and_store_attributions();
+		auto attr_rp = compute_and_store_attributions(parent_attributions_json);
 		if (!attr_rp.first) {
 			txn_error = "Failed to recompute attributions for '" + lot_name + "': " + attr_rp.second;
 			return false;
@@ -1189,7 +1221,8 @@ bool lotman::Lot::reload_and_recompute_attributions(std::string &txn_error) {
 
 // Non-transactional helper: stores parents, reloads state, recomputes attributions, validates.
 // Caller MUST hold an active storage.transaction().
-bool lotman::Lot::add_parents_impl(const std::vector<Lot> &parents, std::string &txn_error) {
+bool lotman::Lot::add_parents_impl(const std::vector<Lot> &parents, std::string &txn_error,
+								   const json &parent_attributions_json) {
 	try {
 		auto rp = store_new_parents(parents);
 		if (!rp.first) {
@@ -1198,7 +1231,7 @@ bool lotman::Lot::add_parents_impl(const std::vector<Lot> &parents, std::string 
 		}
 
 		if (lot_name != "default") {
-			if (!reload_and_recompute_attributions(txn_error)) {
+			if (!reload_and_recompute_attributions(txn_error, parent_attributions_json)) {
 				return false;
 			}
 		}
@@ -1221,7 +1254,8 @@ std::pair<bool, std::string> lotman::Lot::add_parents(const std::vector<Lot> &pa
 	return std::make_pair(true, "");
 }
 
-bool lotman::Lot::add_parents_in_txn(const std::vector<Lot> &parents, std::string &txn_error) {
+bool lotman::Lot::add_parents_in_txn(const std::vector<Lot> &parents, std::string &txn_error,
+									 const json &parent_attributions_json) {
 	// Perform a cycle check
 	// Build the list of all proposed parents
 	std::vector<std::string> parent_names;
@@ -1246,7 +1280,7 @@ bool lotman::Lot::add_parents_in_txn(const std::vector<Lot> &parents, std::strin
 		return false;
 	}
 
-	return add_parents_impl(parents, txn_error);
+	return add_parents_impl(parents, txn_error, parent_attributions_json);
 }
 
 std::pair<bool, std::string> lotman::Lot::add_paths(const std::vector<json> &paths) {
@@ -2208,16 +2242,18 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_opp(
 																				const bool recursive_children) {
 	std::vector<std::string> lots_past_opp;
 	if (recursive_quota) {
-		// Skip lots whose storage axis is unbounded (dedicated_GB == 0 AND
-		// opportunistic_GB == 0 is the unbounded-storage sentinel; such a lot
-		// is never "past" its quota).
+		// Skip lots whose dedicated or opportunistic axis is the unbounded
+		// sentinel (-1). When dedicated_GB == -1 the storage axis is fully
+		// unbounded; when opportunistic_GB == -1 the burst capacity is
+		// unbounded, so the (ded+opp) total is meaningless. In either case
+		// the lot can never be "past" its opportunistic quota.
 		std::string rec_opp_usage_query =
 			"SELECT "
 			"lot_usage.lot_name "
 			"FROM lot_usage "
 			"INNER JOIN management_policy_attributes ON lot_usage.lot_name=management_policy_attributes.lot_name "
-			"WHERE NOT (management_policy_attributes.dedicated_GB = 0 AND "
-			"           management_policy_attributes.opportunistic_GB = 0) "
+			"WHERE management_policy_attributes.dedicated_GB != -1 "
+			"  AND management_policy_attributes.opportunistic_GB != -1 "
 			"AND lot_usage.self_GB + lot_usage.children_GB >= management_policy_attributes.dedicated_GB + "
 			"management_policy_attributes.opportunistic_GB;";
 		auto rp = lotman::db::SQL_get_matches(rec_opp_usage_query);
@@ -2233,8 +2269,8 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_opp(
 			"lot_usage.lot_name "
 			"FROM lot_usage "
 			"INNER JOIN management_policy_attributes ON lot_usage.lot_name=management_policy_attributes.lot_name "
-			"WHERE NOT (management_policy_attributes.dedicated_GB = 0 AND "
-			"           management_policy_attributes.opportunistic_GB = 0) "
+			"WHERE management_policy_attributes.dedicated_GB != -1 "
+			"  AND management_policy_attributes.opportunistic_GB != -1 "
 			"AND lot_usage.self_GB >= management_policy_attributes.dedicated_GB + "
 			"management_policy_attributes.opportunistic_GB;";
 
@@ -2277,15 +2313,15 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_ded(
 																				const bool recursive_children) {
 	std::vector<std::string> lots_past_ded;
 	if (recursive_quota) {
-		// Skip lots with dedicated_GB == 0 (unbounded-storage sentinel: a lot
-		// with both dedicated_GB and opportunistic_GB equal to 0 has unbounded
-		// storage and can never be past its dedicated quota).
+		// Skip lots with dedicated_GB == -1 (unbounded-dedicated sentinel).
+		// A lot with dedicated_GB == 0 (literal: no guaranteed storage) is
+		// kept and is "past" its dedicated quota the moment it has any usage.
 		std::string rec_ded_usage_query =
 			"SELECT "
 			"lot_usage.lot_name "
 			"FROM lot_usage "
 			"INNER JOIN management_policy_attributes ON lot_usage.lot_name=management_policy_attributes.lot_name "
-			"WHERE management_policy_attributes.dedicated_GB > 0 "
+			"WHERE management_policy_attributes.dedicated_GB != -1 "
 			"AND lot_usage.self_GB + lot_usage.children_GB >= management_policy_attributes.dedicated_GB;";
 
 		auto rp = lotman::db::SQL_get_matches(rec_ded_usage_query);
@@ -2301,7 +2337,7 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_ded(
 			"lot_usage.lot_name "
 			"FROM lot_usage "
 			"INNER JOIN management_policy_attributes ON lot_usage.lot_name=management_policy_attributes.lot_name "
-			"WHERE management_policy_attributes.dedicated_GB > 0 "
+			"WHERE management_policy_attributes.dedicated_GB != -1 "
 			"AND lot_usage.self_GB >= management_policy_attributes.dedicated_GB;";
 
 		auto rp = lotman::db::SQL_get_matches(ded_usage_query);
@@ -2343,13 +2379,13 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_obj(
 																				const bool recursive_children) {
 	std::vector<std::string> lots_past_obj;
 	if (recursive_quota) {
-		// Skip lots with max_num_objects == 0 (unbounded-objects sentinel).
+		// Skip lots with max_num_objects == -1 (unbounded-objects sentinel).
 		std::string rec_obj_usage_query =
 			"SELECT "
 			"lot_usage.lot_name "
 			"FROM lot_usage "
 			"INNER JOIN management_policy_attributes ON lot_usage.lot_name=management_policy_attributes.lot_name "
-			"WHERE management_policy_attributes.max_num_objects > 0 "
+			"WHERE management_policy_attributes.max_num_objects != -1 "
 			"AND lot_usage.self_objects + lot_usage.children_objects >= "
 			"management_policy_attributes.max_num_objects;";
 
@@ -2366,7 +2402,7 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_obj(
 			"lot_usage.lot_name "
 			"FROM lot_usage "
 			"INNER JOIN management_policy_attributes ON lot_usage.lot_name=management_policy_attributes.lot_name "
-			"WHERE management_policy_attributes.max_num_objects > 0 "
+			"WHERE management_policy_attributes.max_num_objects != -1 "
 			"AND lot_usage.self_objects >= management_policy_attributes.max_num_objects;";
 
 		auto rp = lotman::db::SQL_get_matches(obj_usage_query);
@@ -2458,7 +2494,8 @@ static void sort_by_depth_descending(std::vector<std::string> &lots) {
 static std::pair<std::vector<std::string>, std::string>
 get_lots_past_threshold_hierarchical(const std::string &self_usage_col, const std::string &child_usage_expr,
 									 const std::string &child_threshold_expr, const std::string &parent_threshold_expr,
-									 const std::string &error_context) {
+									 const std::string &parent_unbounded_predicate,
+									 const std::string &child_unbounded_predicate, const std::string &error_context) {
 
 	// Defense-in-depth: validate all SQL fragments against known-good values.
 	// All callers pass compile-time constants, but this prevents future misuse.
@@ -2471,34 +2508,42 @@ get_lots_past_threshold_hierarchical(const std::string &self_usage_col, const st
 														"p_mpa.dedicated_GB",
 														"p_mpa.dedicated_GB + p_mpa.opportunistic_GB",
 														"p_mpa.max_num_objects"};
+	static const std::set<std::string> allowed_unbounded_predicates = {
+		"p_mpa.dedicated_GB = -1",
+		"p_mpa.dedicated_GB = -1 OR p_mpa.opportunistic_GB = -1",
+		"p_mpa.max_num_objects = -1",
+		"c_mpa.dedicated_GB = -1",
+		"c_mpa.dedicated_GB = -1 OR c_mpa.opportunistic_GB = -1",
+		"c_mpa.max_num_objects = -1"};
 
 	if (allowed_usage_cols.find(self_usage_col) == allowed_usage_cols.end() ||
 		allowed_exprs.find(child_usage_expr) == allowed_exprs.end() ||
 		allowed_exprs.find(child_threshold_expr) == allowed_exprs.end() ||
-		allowed_exprs.find(parent_threshold_expr) == allowed_exprs.end()) {
+		allowed_exprs.find(parent_threshold_expr) == allowed_exprs.end() ||
+		allowed_unbounded_predicates.find(parent_unbounded_predicate) == allowed_unbounded_predicates.end() ||
+		allowed_unbounded_predicates.find(child_unbounded_predicate) == allowed_unbounded_predicates.end()) {
 		return std::make_pair(std::vector<std::string>(),
 							  "Internal error: unrecognized SQL fragment in hierarchical query");
 	}
 
-	// Per-axis sentinel handling:
-	//   * Parent threshold == 0 marks that axis as unbounded; the parent can
-	//     never be "past" its quota on that axis, so we exclude such parents.
-	//   * Child threshold == 0 marks the child as unbounded on that axis;
-	//     such a child can only exist under an unbounded parent (rejected
-	//     by axiom 1 otherwise), but defensively we treat its overflow
-	//     contribution as 0 so an unbounded child can never push a parent
-	//     past quota.
+	// Per-axis sentinel handling (-1 marks an axis as unbounded):
+	//   * Parents that are unbounded on the relevant axis are excluded
+	//     entirely -- they can never be "past" their quota on that axis.
+	//   * Children that are unbounded on the axis can only legally exist
+	//     under an unbounded parent (rejected by axiom 1 otherwise);
+	//     defensively we treat their overflow contribution as 0 so they can
+	//     never push a parent past its own quota.
 	std::string query = "SELECT p_usage.lot_name "
 						"FROM lot_usage p_usage "
 						"JOIN management_policy_attributes p_mpa ON p_usage.lot_name = p_mpa.lot_name "
-						"WHERE (" +
-						parent_threshold_expr +
-						") > 0 "
+						"WHERE NOT (" +
+						parent_unbounded_predicate +
+						") "
 						"AND p_usage." +
 						self_usage_col +
 						" + COALESCE("
 						"    (SELECT SUM(CASE WHEN (" +
-						child_threshold_expr + ") = 0 THEN 0 ELSE MAX(0, (" + child_usage_expr + ") - (" +
+						child_unbounded_predicate + ") THEN 0 ELSE MAX(0, (" + child_usage_expr + ") - (" +
 						child_threshold_expr +
 						")) END) "
 						"     FROM parents c_par "
@@ -2524,7 +2569,8 @@ lotman::Lot::get_lots_past_ded(const bool recursive_quota, const bool recursive_
 		return get_lots_past_ded(recursive_quota, recursive_children);
 	}
 	return get_lots_past_threshold_hierarchical("self_GB", "c_usage.self_GB + c_usage.children_GB",
-												"c_mpa.dedicated_GB", "p_mpa.dedicated_GB", "adjusted dedicated query");
+												"c_mpa.dedicated_GB", "p_mpa.dedicated_GB", "p_mpa.dedicated_GB = -1",
+												"c_mpa.dedicated_GB = -1", "adjusted dedicated query");
 }
 
 std::pair<std::vector<std::string>, std::string>
@@ -2534,7 +2580,8 @@ lotman::Lot::get_lots_past_opp(const bool recursive_quota, const bool recursive_
 	}
 	return get_lots_past_threshold_hierarchical(
 		"self_GB", "c_usage.self_GB + c_usage.children_GB", "c_mpa.dedicated_GB + c_mpa.opportunistic_GB",
-		"p_mpa.dedicated_GB + p_mpa.opportunistic_GB", "adjusted opportunistic query");
+		"p_mpa.dedicated_GB + p_mpa.opportunistic_GB", "p_mpa.dedicated_GB = -1 OR p_mpa.opportunistic_GB = -1",
+		"c_mpa.dedicated_GB = -1 OR c_mpa.opportunistic_GB = -1", "adjusted opportunistic query");
 }
 
 std::pair<std::vector<std::string>, std::string>
@@ -2542,9 +2589,9 @@ lotman::Lot::get_lots_past_obj(const bool recursive_quota, const bool recursive_
 	if (!hierarchical) {
 		return get_lots_past_obj(recursive_quota, recursive_children);
 	}
-	return get_lots_past_threshold_hierarchical("self_objects", "c_usage.self_objects + c_usage.children_objects",
-												"c_mpa.max_num_objects", "p_mpa.max_num_objects",
-												"adjusted objects query");
+	return get_lots_past_threshold_hierarchical(
+		"self_objects", "c_usage.self_objects + c_usage.children_objects", "c_mpa.max_num_objects",
+		"p_mpa.max_num_objects", "p_mpa.max_num_objects = -1", "c_mpa.max_num_objects = -1", "adjusted objects query");
 }
 
 std::pair<json, std::string> lotman::Lot::get_available_capacity(const std::string &parent_lot_name, int64_t start_time,
@@ -2563,22 +2610,23 @@ std::pair<json, std::string> lotman::Lot::get_available_capacity(const std::stri
 		auto events = build_attribution_events(parent_lot_name, start_time, end_time);
 		auto peak = run_sweep_line(events);
 
-		// Per-axis sentinel handling: a parent that is unbounded on an axis
+		// Per-axis sentinel handling: a parent that is unbounded on a sub-axis
 		// has no meaningful "available" value on that axis (the cap is +inf).
 		// Report null for those fields rather than a negative or misleading
 		// number; callers can detect unbounded by checking for null.
-		const bool parent_unbounded_storage =
-			is_unbounded_storage(parent_mpa->dedicated_GB, parent_mpa->opportunistic_GB);
+		const bool parent_unb_ded = is_unbounded_dedicated(parent_mpa->dedicated_GB);
+		const bool parent_unb_opp = is_unbounded_opportunistic(parent_mpa->opportunistic_GB);
 		const bool parent_unbounded_objects = is_unbounded_objects(parent_mpa->max_num_objects);
 
 		json result;
-		if (parent_unbounded_storage) {
-			result["available_dedicated_GB"] = nullptr;
-			result["available_opportunistic_GB"] = nullptr;
+		result["available_dedicated_GB"] =
+			parent_unb_ded ? json(nullptr) : json(parent_mpa->dedicated_GB - peak.peak_ded);
+		result["available_opportunistic_GB"] =
+			parent_unb_opp ? json(nullptr) : json(parent_mpa->opportunistic_GB - peak.peak_opp);
+		// available_total_GB is meaningful only when both sub-axes are bounded.
+		if (parent_unb_ded || parent_unb_opp) {
 			result["available_total_GB"] = nullptr;
 		} else {
-			result["available_dedicated_GB"] = parent_mpa->dedicated_GB - peak.peak_ded;
-			result["available_opportunistic_GB"] = parent_mpa->opportunistic_GB - peak.peak_opp;
 			double parent_total = parent_mpa->dedicated_GB + parent_mpa->opportunistic_GB;
 			result["available_total_GB"] = parent_total - peak.peak_total;
 		}
@@ -2929,6 +2977,28 @@ std::pair<bool, std::string> lotman::Lot::compute_and_store_attributions(const j
 
 		for (const auto &mpa_key : mpa_keys) {
 			double total_child_value = child_mpas.at(mpa_key);
+
+			// Unbounded child sentinel (-1): the unbounded designation flows
+			// to each parent — every parent attribution stores fraction = 1.0
+			// so that downstream consumers reconstruct "child.mpa * fraction"
+			// as -1 (i.e. unbounded) for every parent. We skip explicit-sum
+			// and remainder-distribution math entirely; if the caller supplied
+			// an explicit value for an unbounded axis we treat that as "this
+			// parent also propagates the unbounded designation". Hierarchy
+			// constraints (unbounded child under a bounded parent) are caught
+			// in validate_axiom1 / validate_axiom2_for_parents_of, not here.
+			if (total_child_value == -1.0) {
+				for (const auto &parent_name : non_self_parents) {
+					db::ParentChildAttribution attr;
+					attr.child_lot_name = lot_name;
+					attr.parent_lot_name = parent_name;
+					attr.mpa_key = mpa_key;
+					attr.fraction = 1.0;
+					storage.replace(attr);
+				}
+				continue;
+			}
+
 			double explicitly_attributed = 0.0;
 			std::vector<std::string> unspecified_parents;
 
@@ -3180,17 +3250,23 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom1(const std::string &chi
 	// Axiom 1: For each parent P of child C, the attributed amount from C to P
 	// must not exceed P's own MPAs.
 	//
-	// Per-axis sentinel handling:
-	//   * If a parent's storage axis is unbounded (dedicated_GB == 0 AND
-	//     opportunistic_GB == 0), no attributed storage value can exceed it,
-	//     so storage checks are skipped for that parent.
-	//   * If a parent's object axis is unbounded (max_num_objects == 0),
-	//     the object check is skipped for that parent.
-	//   * If the child is unbounded on an axis but a parent is bounded on
-	//     that axis, the child cannot fit and the relationship is rejected.
-	//   * If the child is in a transient partial-zero storage state during a
-	//     multi-field update, defer; the post-loop invariant check in
+	// Per-axis sentinel handling: each of the three sub-axes (dedicated_GB,
+	// opportunistic_GB, max_num_objects) is checked independently.
+	//   * If a parent is unbounded on a sub-axis (-1 sentinel), that sub-axis
+	//     check is skipped entirely (no finite child value can exceed +inf).
+	//   * If a child is unbounded on a sub-axis but the parent is bounded on
+	//     the same sub-axis, the child cannot fit and the relationship is
+	//     rejected.
+	//   * If the child or parent is in the transient partial-storage state
+	//     (dedicated_GB == -1 with opportunistic_GB != -1) during a multi-
+	//     field update, defer; the post-loop invariant check in
 	//     lotman_update_lot rejects any persisting partial state.
+	//
+	// Note: there is intentionally no "combined" (dedicated + opportunistic)
+	// cap check. Dedicated and opportunistic are different storage pools, so
+	// per-pool caps are sufficient and the combined check would conflate
+	// independent sub-axes (and break in obvious ways once either pool is
+	// the unbounded sentinel).
 	try {
 		auto &storage = db::StorageManager::get_storage();
 		using namespace sqlite_orm;
@@ -3205,7 +3281,8 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom1(const std::string &chi
 			// Defer: transient state inside an in-progress MPA update.
 			return std::make_pair(true, "");
 		}
-		const bool child_unbounded_storage = is_unbounded_storage(child_mpa->dedicated_GB, child_mpa->opportunistic_GB);
+		const bool child_unb_ded = is_unbounded_dedicated(child_mpa->dedicated_GB);
+		const bool child_unb_opp = is_unbounded_opportunistic(child_mpa->opportunistic_GB);
 		const bool child_unbounded_objects = is_unbounded_objects(child_mpa->max_num_objects);
 
 		// Get non-self parents from the parents table (authoritative source)
@@ -3242,28 +3319,31 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom1(const std::string &chi
 				// Defer: transient state inside an in-progress MPA update.
 				continue;
 			}
-			const bool parent_unbounded_storage =
-				is_unbounded_storage(parent_mpa->dedicated_GB, parent_mpa->opportunistic_GB);
+			const bool parent_unb_ded = is_unbounded_dedicated(parent_mpa->dedicated_GB);
+			const bool parent_unb_opp = is_unbounded_opportunistic(parent_mpa->opportunistic_GB);
 			const bool parent_unbounded_objects = is_unbounded_objects(parent_mpa->max_num_objects);
 
 			// An unbounded child cannot fit inside a bounded parent on the
-			// same axis: the child's effective allocation on that axis is
+			// same sub-axis: the child's effective allocation on that axis is
 			// "infinite", which exceeds any finite parent cap.
-			if (child_unbounded_storage && !parent_unbounded_storage) {
-				return std::make_pair(false,
-									  "Hierarchy violation: child lot '" + child_lot_name +
-										  "' has unbounded storage (dedicated_GB == 0 and opportunistic_GB == 0) "
-										  "but parent lot '" +
-										  parent_name +
-										  "' has a bounded storage axis. An unbounded child requires every parent "
-										  "to also be unbounded on that axis.");
+			if (child_unb_ded && !parent_unb_ded) {
+				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name +
+												 "' has unbounded dedicated_GB (-1) but parent lot '" + parent_name +
+												 "' has a bounded dedicated_GB. An unbounded child requires every "
+												 "parent to also be unbounded on that sub-axis.");
+			}
+			if (child_unb_opp && !parent_unb_opp) {
+				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name +
+												 "' has unbounded opportunistic_GB (-1) but parent lot '" +
+												 parent_name +
+												 "' has a bounded opportunistic_GB. An unbounded child requires "
+												 "every parent to also be unbounded on that sub-axis.");
 			}
 			if (child_unbounded_objects && !parent_unbounded_objects) {
 				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name +
-												 "' has unbounded max_num_objects (== 0) but parent lot '" +
-												 parent_name +
+												 "' has unbounded max_num_objects (-1) but parent lot '" + parent_name +
 												 "' has a bounded max_num_objects. An unbounded child requires "
-												 "every parent to also be unbounded on that axis.");
+												 "every parent to also be unbounded on that sub-axis.");
 			}
 
 			// Compute attributed values
@@ -3276,31 +3356,24 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom1(const std::string &chi
 								  ? std::round(fractions.at("max_num_objects") * child_mpa->max_num_objects)
 								  : 0.0;
 
-			// Storage axis: skip the per-axis cap checks if the parent's
-			// storage axis is unbounded.
-			if (!parent_unbounded_storage) {
-				// Check: attributed dedicated ≤ parent dedicated
-				if (attr_ded > parent_mpa->dedicated_GB + 1e-9) {
-					return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name + "' attributes " +
-													 std::to_string(attr_ded) + " dedicated_GB to parent lot '" +
-													 parent_name +
-													 "', which exceeds the parent's dedicated_GB allocation of " +
-													 std::to_string(parent_mpa->dedicated_GB) +
-													 ". A child lot's allocation may not exceed any parent's.");
-				}
+			// Per-sub-axis cap checks. Each axis is skipped when the parent
+			// is unbounded on it.
+			if (!parent_unb_ded && attr_ded > parent_mpa->dedicated_GB + 1e-9) {
+				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name + "' attributes " +
+												 std::to_string(attr_ded) + " dedicated_GB to parent lot '" +
+												 parent_name +
+												 "', which exceeds the parent's dedicated_GB allocation of " +
+												 std::to_string(parent_mpa->dedicated_GB) +
+												 ". A child lot's allocation may not exceed any parent's.");
+			}
 
-				// Check: attributed (ded+opp) ≤ parent (ded+opp)
-				double attr_total = attr_ded + attr_opp;
-				double parent_total = parent_mpa->dedicated_GB + parent_mpa->opportunistic_GB;
-				if (attr_total > parent_total + 1e-9) {
-					return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name + "' attributes " +
-													 std::to_string(attr_total) +
-													 " total GB (dedicated + opportunistic) to parent lot '" +
-													 parent_name +
-													 "', which exceeds the parent's combined allocation of " +
-													 std::to_string(parent_total) +
-													 " GB. A child lot's allocation may not exceed any parent's.");
-				}
+			if (!parent_unb_opp && attr_opp > parent_mpa->opportunistic_GB + 1e-9) {
+				return std::make_pair(false, "Hierarchy violation: child lot '" + child_lot_name + "' attributes " +
+												 std::to_string(attr_opp) + " opportunistic_GB to parent lot '" +
+												 parent_name +
+												 "', which exceeds the parent's opportunistic_GB allocation of " +
+												 std::to_string(parent_mpa->opportunistic_GB) +
+												 ". A child lot's allocation may not exceed any parent's.");
 			}
 
 			// Object axis: skip if the parent's object axis is unbounded.
@@ -3328,13 +3401,14 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom2_for_parents_of(const s
 	// concurrently-active children's attributed MPAs exceed P's own MPAs.
 	// Uses a sweep-line over children's [creation_time, expiration_time) intervals.
 	//
-	// Per-axis sentinel handling: a parent that is unbounded on an axis
-	// (storage axis: dedicated_GB == 0 AND opportunistic_GB == 0; object
-	// axis: max_num_objects == 0) cannot be exceeded on that axis, so the
-	// per-axis cap check is skipped for that parent. Cross-axis containment
-	// (an unbounded child under a bounded parent) is rejected by axiom 1
-	// before the sweep is reached, so children feeding into the sweep are
-	// guaranteed to be bounded on each axis the parent is bounded on.
+	// Per-axis sentinel handling: each sub-axis (dedicated_GB, opportunistic_GB,
+	// max_num_objects) is checked independently; the per-sub-axis cap check is
+	// skipped when the parent is unbounded (-1) on that sub-axis. Cross-axis
+	// containment (an unbounded child under a bounded parent on the same axis)
+	// is rejected by axiom 1 before the sweep is reached, so children feeding
+	// into the sweep are guaranteed to be bounded on each axis the parent is
+	// bounded on. As in axiom 1, the per-pool checks are sufficient -- there
+	// is no separate "combined" (ded+opp) cap.
 	try {
 		auto &storage = db::StorageManager::get_storage();
 		using namespace sqlite_orm;
@@ -3354,45 +3428,37 @@ std::pair<bool, std::string> lotman::Lot::validate_axiom2_for_parents_of(const s
 				// Defer: transient state inside an in-progress MPA update.
 				continue;
 			}
-			const bool parent_unbounded_storage =
-				is_unbounded_storage(parent_mpa->dedicated_GB, parent_mpa->opportunistic_GB);
+			const bool parent_unb_ded = is_unbounded_dedicated(parent_mpa->dedicated_GB);
+			const bool parent_unb_opp = is_unbounded_opportunistic(parent_mpa->opportunistic_GB);
 			const bool parent_unbounded_objects = is_unbounded_objects(parent_mpa->max_num_objects);
 
-			// If the parent is unbounded on every axis, no peak can exceed
+			// If the parent is unbounded on every sub-axis, no peak can exceed
 			// it; skip the sweep entirely.
-			if (parent_unbounded_storage && parent_unbounded_objects)
+			if (parent_unb_ded && parent_unb_opp && parent_unbounded_objects)
 				continue;
 
 			// Build sweep-line events from children's attributions
 			auto events = build_attribution_events(parent_name);
 			auto peak = run_sweep_line(events);
 
-			if (!parent_unbounded_storage) {
-				// Check: peak dedicated ≤ parent dedicated
-				if (peak.peak_ded > parent_mpa->dedicated_GB + 1e-9) {
-					return std::make_pair(
-						false, "Hierarchy violation: peak concurrent dedicated_GB across children of parent lot '" +
-								   parent_name + "' is " + std::to_string(peak.peak_ded) +
-								   ", which exceeds the parent's dedicated_GB allocation of " +
-								   std::to_string(parent_mpa->dedicated_GB) +
-								   ". The combined allocations of children active at the same time may not exceed "
-								   "the parent's capacity.");
-				}
+			if (!parent_unb_ded && peak.peak_ded > parent_mpa->dedicated_GB + 1e-9) {
+				return std::make_pair(
+					false, "Hierarchy violation: peak concurrent dedicated_GB across children of parent lot '" +
+							   parent_name + "' is " + std::to_string(peak.peak_ded) +
+							   ", which exceeds the parent's dedicated_GB allocation of " +
+							   std::to_string(parent_mpa->dedicated_GB) +
+							   ". The combined allocations of children active at the same time may not exceed "
+							   "the parent's capacity.");
+			}
 
-				// Check: peak (ded+opp) ≤ parent (ded+opp)
-				// Use peak_total which is the true max of (ded+opp) at a single point in time,
-				// not the sum of independent peaks which can occur at different times.
-				double parent_total = parent_mpa->dedicated_GB + parent_mpa->opportunistic_GB;
-				if (peak.peak_total > parent_total + 1e-9) {
-					return std::make_pair(false,
-										  "Hierarchy violation: peak concurrent total GB (dedicated + "
-										  "opportunistic) across children of parent lot '" +
-											  parent_name + "' is " + std::to_string(peak.peak_total) +
-											  ", which exceeds the parent's combined allocation of " +
-											  std::to_string(parent_total) +
-											  " GB. The combined allocations of children active at the same time "
-											  "may not exceed the parent's capacity.");
-				}
+			if (!parent_unb_opp && peak.peak_opp > parent_mpa->opportunistic_GB + 1e-9) {
+				return std::make_pair(
+					false, "Hierarchy violation: peak concurrent opportunistic_GB across children of parent lot '" +
+							   parent_name + "' is " + std::to_string(peak.peak_opp) +
+							   ", which exceeds the parent's opportunistic_GB allocation of " +
+							   std::to_string(parent_mpa->opportunistic_GB) +
+							   ". The combined allocations of children active at the same time may not exceed "
+							   "the parent's capacity.");
 			}
 
 			if (!parent_unbounded_objects) {

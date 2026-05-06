@@ -90,16 +90,27 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg);
 			needs to create space.
 		"max_num_objects": An int64 indicating the maxiximum number of objects a lot may have attributed to it.
 
-			Sentinel for unbounded MPAs: a value of 0 on a quota MPA marks that resource axis as
-			unbounded for this lot. MPAs are grouped into independent axes that are validated
-			internally but treated independently of each other:
-			  * Storage axis (dedicated_GB + opportunistic_GB): the axis is unbounded iff BOTH
-				dedicated_GB and opportunistic_GB are 0. Setting dedicated_GB to 0 with
-				opportunistic_GB > 0 is rejected -- if the dedicated capacity is unbounded, a finite
-				opportunistic cap is meaningless. The reverse (dedicated_GB > 0 with
-				opportunistic_GB == 0) is allowed and means the lot has no opportunistic burst
-				capacity.
-			  * Object-count axis (max_num_objects): unbounded iff 0.
+			Sentinel for unbounded MPAs: a value of -1 on a quota MPA marks that resource axis
+			as unbounded for this lot. (Note: timestamp MPAs use 0 as a separate sentinel; see
+			creation_time below.) MPAs are grouped into independent axes that are validated
+			separately:
+			  * Storage axis: dedicated_GB and opportunistic_GB are independent storage pools.
+				A value of -1 on either axis means "unbounded" on that axis. Because
+				opportunistic_GB tracks data ABOVE the dedicated allotment, an unbounded
+				dedicated allotment is meaningless without an unbounded opportunistic axis;
+				therefore dedicated_GB == -1 requires opportunistic_GB == -1 (any other
+				combination with dedicated_GB == -1 is rejected). All other combinations are
+				legal:
+				  - (dedicated_GB == 0, opportunistic_GB == 0): no storage at all (rare; useful
+					mostly as a placeholder).
+				  - (dedicated_GB == 0, opportunistic_GB >= 0 or -1): a "purely opportunistic"
+					lot with no guaranteed allotment.
+				  - (dedicated_GB > 0, opportunistic_GB == 0): finite guaranteed allotment with
+					no burst capacity.
+				  - (dedicated_GB > 0, opportunistic_GB > 0 or -1): finite guaranteed allotment
+					with a finite or unbounded burst.
+				  - (dedicated_GB == -1, opportunistic_GB == -1): fully unbounded storage.
+			  * Object-count axis (max_num_objects): -1 == unbounded; 0 == no objects allowed.
 			Different axes are independent: a lot may be unbounded on one axis and bounded on
 			another (e.g. unbounded storage with a finite max_num_objects). Under strict_hierarchy,
 			a child that is unbounded on an axis requires every parent to also be unbounded on that
