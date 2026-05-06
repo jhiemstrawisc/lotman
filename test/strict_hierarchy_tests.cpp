@@ -7585,4 +7585,62 @@ TEST_F(StrictHierarchyTest, AvailableCapacityUnboundedChildPeakIsZero) {
 		<< "peak_max_num_objects must be 0 for an unbounded child, not -1";
 }
 
+// Regression: parent_attributions schema must accept the -1 unbounded sentinel
+// on opportunistic_GB and max_num_objects so that callers (e.g. Pelican's
+// nested-namespace tree allocator) can propagate a parent's unbounded axis to
+// the child's per-parent attribution. Before the fix, parent_attributions_def
+// declared "minimum": 0 on every axis, which rejected the same -1 value that
+// the management_policy_attrs block accepted.
+TEST_F(StrictHierarchyTest, ParentAttributionsAcceptsUnboundedSentinel) {
+	addDefaultLot();
+
+	// Parent is unbounded on opportunistic_GB and max_num_objects.
+	addLot(R"({
+		"lot_name": "pa_unb_parent",
+		"owner": "owner1",
+		"parents": ["pa_unb_parent"],
+		"paths": [{"path": "/pa/unb/parent", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 100,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
+			"creation_time": 100,
+			"expiration_time": 9000,
+			"deletion_time": 9500
+		}
+	})");
+
+	char *raw_err = nullptr;
+	int rv = lotman_set_context_str("strict_hierarchy", "true", &raw_err);
+	UniqueCString err(raw_err);
+	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "<no error>");
+
+	// Child propagates -1 on the parent's unbounded axes via parent_attributions.
+	rv = lotman_add_lot(R"({
+		"lot_name": "pa_unb_child",
+		"owner": "owner1",
+		"parents": ["pa_unb_parent"],
+		"paths": [{"path": "/pa/unb/parent/c", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 50,
+			"opportunistic_GB": -1,
+			"max_num_objects": -1,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 9000
+		},
+		"parent_attributions": {
+			"pa_unb_parent": {
+				"dedicated_GB": 50,
+				"opportunistic_GB": -1,
+				"max_num_objects": -1
+			}
+		}
+	})",
+						&raw_err);
+	err.reset(raw_err);
+	EXPECT_EQ(rv, 0) << "parent_attributions must accept the -1 unbounded sentinel: "
+					 << (err.get() ? err.get() : "<no error>");
+}
+
 } // namespace
