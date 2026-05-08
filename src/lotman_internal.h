@@ -427,7 +427,12 @@ class Lot {
 	// per-step axiom revalidation), but does NOT open its own transaction.
 	// Returns false and sets txn_error on failure to trigger rollback.
 	bool update_owner_in_txn(const std::string &update_val, std::string &txn_error);
-	bool update_parents_in_txn(const json &update_arr, std::string &txn_error);
+	// `revalidate_paths` controls whether this lot's paths are re-checked
+	// against the new ancestry within this call. Standalone callers want
+	// true; the lotman_update_lot dispatcher passes false and runs a
+	// single end-of-transaction revalidation so that simultaneous
+	// path-and-parent edits validate against the final committed state.
+	bool update_parents_in_txn(const json &update_arr, std::string &txn_error, bool revalidate_paths = true);
 	bool update_paths_in_txn(const json &update_arr, std::string &txn_error);
 	bool update_man_policy_attrs_in_txn(const std::string &update_key, double update_val, std::string &txn_error);
 	bool update_attributions_in_txn(const json &parent_attributions_json, std::string &txn_error);
@@ -437,6 +442,16 @@ class Lot {
 	// back to a pure equal split across all parents.
 	bool add_parents_in_txn(const std::vector<Lot> &parents, std::string &txn_error,
 							const json &parent_attributions_json = json());
+
+	// Re-run check_path_temporal_overlap for every non-excluded path on this
+	// lot against the current DB state. Used after parent-edge or MPA-window
+	// changes (and at the end of lotman_update_lot's outer transaction) so
+	// simultaneous edits validate against the final committed state. The
+	// default lot is a no-op (it is always the path-of-last-resort and never
+	// has its paths legitimized by ancestry). Caller MUST hold an active
+	// storage.transaction(). Returns false and sets txn_error on the first
+	// violation.
+	bool revalidate_paths_in_txn(std::string &txn_error);
 
   private:
 	std::pair<bool, std::string> write_new();
@@ -452,9 +467,33 @@ class Lot {
 
 	// Check whether a path conflicts with another lot's claim during overlapping time ranges.
 	// Caller MUST be inside an active storage.transaction().
+	//
+	// Conflict rules (the candidate path is the new/updated path on `lot_name`):
+	//   - EXACT collision: another live lot owns exactly `normalized_path` (any
+	//     recursive flag) → reject.
+	//   - PREFIX-IN: another live lot owns a strict prefix of `normalized_path`
+	//     with `recursive=1` → allowed only if `lot_name` is a recursive
+	//     descendant of that lot. (Dynamic-ownership rule: the deepest sublot
+	//     dynamically claims the subpath.)
+	//   - PREFIX-OUT: `recursive` is true on the candidate AND another live lot
+	//     owns a strict prefix-suffix path under `normalized_path` → allowed
+	//     only if that lot is a recursive descendant of `lot_name`.
+	//
+	// Excluded rows (`exclude=1`) on either side are ignored (escape hatch).
+	// The `recursive` flag describes the candidate path being checked.
 	static std::pair<bool, std::string> check_path_temporal_overlap(const std::string &lot_name,
-																	const std::string &normalized_path,
+																	const std::string &normalized_path, bool recursive,
 																	int64_t creation_time, int64_t expiration_time);
+
+	// Returns (true, "") if `descendant` is reachable from `ancestor` via the
+	// parents table (i.e., `ancestor` appears among `descendant`'s recursive
+	// parents). Returns (false, "") if no such path exists or if
+	// `ancestor == descendant`. On a storage error, returns (false, <reason>)
+	// so the caller can surface a precise diagnostic instead of misreporting
+	// a descendancy violation. Caller MUST be inside an active
+	// storage.transaction() (or otherwise hold the storage).
+	static std::pair<bool, std::string> is_recursive_ancestor(const std::string &ancestor,
+															  const std::string &descendant);
 
 	// Non-transactional helpers for composing inside an outer transaction.
 	// Callers MUST hold an active storage.transaction().

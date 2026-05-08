@@ -71,9 +71,22 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg);
 		{"path": "/path/to/associate", "recursive": bool, "exclude": bool}
 		When "recursive" is true, all subdirectories of the path are also attributed to the lot. When false,
 		only non-directory objects below the path should be attributed, but any subdirectories should not be.
-		When "exclude" is true, this path is excluded from the lot's tracking. This allows for patterns like
-		"track everything under /foo recursively, except /foo/bar". The "exclude" field is optional and
-		defaults to false if not specified.
+
+		Path-to-lot resolution is dynamic: when several live lots' paths could match a directory, the
+		lot whose path is the longest prefix of the query path "wins" (deepest descendant). This means
+		a sublot whose path is a strict subpath of an ancestor's recursive path automatically claims its
+		subtree without requiring an explicit "exclude" row on the ancestor — and reverts ownership back
+		to the ancestor when the sublot is removed or expires.
+
+		Descendancy rule (enforced when adding/updating non-excluded paths): if another live lot's
+		recursive path is a strict prefix of the candidate path, the candidate's lot must be a recursive
+		descendant of that other lot. Symmetrically, a recursive candidate path that would cover an
+		existing lot's path requires that other lot to be a recursive descendant of the candidate.
+		Same-path collisions during overlapping time windows are always rejected.
+
+		When "exclude" is true, this path row is an escape hatch: it is ignored by both path resolution
+		and the descendancy/temporal-overlap check. Prefer the dynamic-ownership model above over
+		explicit exclusions. The "exclude" field is optional and defaults to false if not specified.
 	"management_policy_attrs":
 		REQUIRED: A JSON object containing the collection of attributes used for creating policies for the
 		lot. The object has the following structure:

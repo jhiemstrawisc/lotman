@@ -5281,11 +5281,15 @@ TEST_F(StrictHierarchyTest, UpdateParentsRecomputesAttributions) {
 		}
 	})");
 
-	// Move child from parent_a to parent_b via update_lot
+	// Move child from parent_a to parent_b via update_lot. Under the
+	// dynamic-ownership rule the child's path must also be moved out of
+	// parent_a's recursive coverage and into parent_b's, so we update
+	// `paths` in the same call.
 	raw_err = nullptr;
 	rv = lotman_update_lot(R"({
 		"lot_name": "child",
-		"parents": [{"current": "parent_a", "new": "parent_b"}]
+		"parents": [{"current": "parent_a", "new": "parent_b"}],
+		"paths": [{"current": "/root/data/a/child", "new": "/root/data/b/child", "recursive": true}]
 	})",
 						   &raw_err);
 	err.reset(raw_err);
