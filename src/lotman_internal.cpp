@@ -322,6 +322,29 @@ std::pair<bool, std::string> lotman::Lot::store_lot(const json &parent_attributi
 				}
 			}
 
+			// Path overlap (descendancy) check is performed AFTER any
+			// insertion adjustment so the parent table reflects the final
+			// hierarchy that this transaction is committing. This is what
+			// permits "reverse insertion" of an ancestor lot that
+			// recursively covers an existing child lot's path.
+			if (lot_name != "default") {
+				for (const auto &path_json : paths) {
+					bool exclude = path_json.contains("exclude") ? path_json["exclude"].get<bool>() : false;
+					if (exclude) {
+						continue;
+					}
+					std::string normalized = ensure_trailing_slash(path_json.at("path").get<std::string>());
+					bool recursive = path_json.at("recursive").get<bool>();
+					auto overlap =
+						check_path_temporal_overlap(lot_name, normalized, recursive, man_policy_attr.creation_time,
+													man_policy_attr.expiration_time);
+					if (!overlap.first) {
+						txn_error = overlap.second;
+						return false;
+					}
+				}
+			}
+
 			return true;
 		});
 
@@ -1381,6 +1404,45 @@ bool lotman::Lot::reload_and_recompute_attributions(std::string &txn_error, cons
 	}
 }
 
+// Non-transactional helper: re-runs check_path_temporal_overlap for every
+// non-excluded path on this lot. Used after parent-edge or MPA-window changes
+// (and at the end of lotman_update_lot's outer transaction) so any path whose
+// legitimacy depended on the previous state is re-checked. The default lot
+// is skipped: it is the path-of-last-resort and its `/default` row is never
+// legitimized by ancestry, so revalidation is meaningless for it.
+// Caller MUST hold an active storage.transaction().
+bool lotman::Lot::revalidate_paths_in_txn(std::string &txn_error) {
+	if (lot_name == "default") {
+		return true;
+	}
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		auto mpa_ptr = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
+		if (!mpa_ptr) {
+			// Lot has no MPA (shouldn't happen for a real lot), nothing to check.
+			return true;
+		}
+
+		auto lot_paths =
+			storage.get_all<db::Path>(where(c(&db::Path::lot_name) == lot_name and c(&db::Path::exclude) == false));
+		for (const auto &p : lot_paths) {
+			auto overlap = check_path_temporal_overlap(lot_name, p.path, p.recursive != 0, mpa_ptr->creation_time,
+													   mpa_ptr->expiration_time);
+			if (!overlap.first) {
+				txn_error =
+					"Revalidation of '" + lot_name + "' against the post-update state failed: " + overlap.second;
+				return false;
+			}
+		}
+		return true;
+	} catch (const std::exception &e) {
+		txn_error = std::string("Failed to revalidate paths: ") + e.what();
+		return false;
+	}
+}
+
 // Non-transactional helper: stores parents, reloads state, recomputes attributions, validates.
 // Caller MUST hold an active storage.transaction().
 bool lotman::Lot::add_parents_impl(const std::vector<Lot> &parents, std::string &txn_error,
@@ -1467,8 +1529,9 @@ bool lotman::Lot::add_paths_in_txn(const std::vector<json> &paths, std::string &
 				std::string normalized = ensure_trailing_slash(path_str);
 
 				bool exclude = path_json.contains("exclude") ? path_json["exclude"].get<bool>() : false;
+				bool recursive = path_json.at("recursive").get<bool>();
 				if (!exclude) {
-					auto overlap = check_path_temporal_overlap(lot_name, normalized, this_mpa->creation_time,
+					auto overlap = check_path_temporal_overlap(lot_name, normalized, recursive, this_mpa->creation_time,
 															   this_mpa->expiration_time);
 					if (!overlap.first) {
 						txn_error = overlap.second;
@@ -1533,6 +1596,12 @@ std::pair<bool, std::string> lotman::Lot::remove_parents(const std::vector<std::
 
 			if (lot_name != "default") {
 				if (!reload_and_recompute_attributions(txn_error)) {
+					return false;
+				}
+				// After parent edges shrink, re-check this lot's paths. A path
+				// that was legitimate only because a removed ancestor recursively
+				// covered it must now be rejected.
+				if (!revalidate_paths_in_txn(txn_error)) {
 					return false;
 				}
 			}
@@ -1618,7 +1687,7 @@ std::pair<bool, std::string> lotman::Lot::update_parents(const json &update_arr)
 	return std::make_pair(true, "");
 }
 
-bool lotman::Lot::update_parents_in_txn(const json &update_arr, std::string &txn_error) {
+bool lotman::Lot::update_parents_in_txn(const json &update_arr, std::string &txn_error, bool revalidate_paths) {
 	// First, perform a cycle check on the whole update arr, and fail if any introduce a cycle
 	// Cycle check takes in three arguments -- The start node (in this case, lot_name), and vectors of parents/children
 	// of the start node as strings
@@ -1661,6 +1730,15 @@ bool lotman::Lot::update_parents_in_txn(const json &update_arr, std::string &txn
 		if (!reload_and_recompute_attributions(txn_error)) {
 			return false;
 		}
+		// Parent edge swap may invalidate paths that depended on the old
+		// ancestry for a (b) PREFIX-IN match. Re-validate. Skipped when
+		// the caller (e.g. the lotman_update_lot dispatcher) plans to run
+		// its own end-of-transaction revalidation against the final state.
+		if (revalidate_paths) {
+			if (!revalidate_paths_in_txn(txn_error)) {
+				return false;
+			}
+		}
 	}
 	return true;
 }
@@ -1693,7 +1771,9 @@ bool lotman::Lot::update_paths_in_txn(const json &update_arr, std::string &txn_e
 			auto path_record = rows[0];
 
 			// Apply field updates
-			path_record.recursive = update_obj["recursive"].get<int>();
+			int new_recursive = update_obj["recursive"].get<int>();
+			bool recursive_changed = (path_record.recursive != new_recursive);
+			path_record.recursive = new_recursive;
 			bool exclude_changed_to_false = false;
 			if (update_obj.contains("exclude")) {
 				int new_exclude = update_obj["exclude"].get<int>();
@@ -1703,17 +1783,24 @@ bool lotman::Lot::update_paths_in_txn(const json &update_arr, std::string &txn_e
 				path_record.exclude = new_exclude;
 			}
 
-			// Check temporal overlap if: (1) path changes, OR (2) exclude flips true→false
-			// In case (2), a previously-excluded path becomes active and might conflict
-			if (current_path != new_path || exclude_changed_to_false) {
+			// Re-check temporal overlap if any state change can introduce a
+			// new conflict against the rest of the DB:
+			//   (1) the path string itself changed,
+			//   (2) exclude flipped true -> false (a previously dormant row
+			//       becomes active), or
+			//   (3) the recursive flag toggled. Under the dynamic-ownership
+			//       rules a flip can introduce or relieve PREFIX-IN /
+			//       PREFIX-OUT conflicts even when the path string and
+			//       exclude flag are unchanged.
+			if (current_path != new_path || exclude_changed_to_false || recursive_changed) {
 				// Check temporal overlap for the path (if not excluded)
 				if (!path_record.exclude) {
 					auto this_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
 					if (this_mpa) {
 						// Use new_path for case (1), current_path for case (2)
 						std::string path_to_check = (current_path != new_path) ? new_path : current_path;
-						auto overlap = check_path_temporal_overlap(lot_name, path_to_check, this_mpa->creation_time,
-																   this_mpa->expiration_time);
+						auto overlap = check_path_temporal_overlap(lot_name, path_to_check, path_record.recursive != 0,
+																   this_mpa->creation_time, this_mpa->expiration_time);
 						if (!overlap.first) {
 							txn_error = overlap.second;
 							return false;
@@ -1846,7 +1933,8 @@ bool lotman::Lot::update_man_policy_attrs_in_txn(const std::string &update_key, 
 		auto lot_paths =
 			storage.get_all<db::Path>(where(c(&db::Path::lot_name) == lot_name and c(&db::Path::exclude) == false));
 		for (const auto &p : lot_paths) {
-			auto overlap = check_path_temporal_overlap(lot_name, p.path, mpa.creation_time, mpa.expiration_time);
+			auto overlap =
+				check_path_temporal_overlap(lot_name, p.path, p.recursive != 0, mpa.creation_time, mpa.expiration_time);
 			if (!overlap.first) {
 				txn_error = "MPA update on '" + lot_name + "' would create path conflict: " + overlap.second;
 				return false;

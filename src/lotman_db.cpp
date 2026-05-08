@@ -16,6 +16,7 @@
 #include <sqlite3.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_set>
 
 using namespace sqlite_orm;
 
@@ -836,21 +837,13 @@ std::pair<bool, std::string> Lot::write_new() {
 			storage.replace(parent_record);
 		}
 
-		// Temporal overlap check: ensure no other lot claims the same path
-		// during an overlapping time period before inserting paths.
-		for (const auto &path_json : paths) {
-			std::string path_str = path_json.at("path").get<std::string>();
-			std::string normalized = ensure_trailing_slash(path_str);
-			bool exclude = path_json.contains("exclude") ? path_json["exclude"].get<bool>() : false;
-
-			if (!exclude) {
-				auto overlap = check_path_temporal_overlap(lot_name, normalized, man_policy_attr.creation_time,
-														   man_policy_attr.expiration_time);
-				if (!overlap.first) {
-					return overlap;
-				}
-			}
-		}
+		// NOTE: Path overlap (descendancy) checks are intentionally NOT
+		// performed here. They are run by store_lot() AFTER insertion
+		// adjustment so that any parent rewiring done by insertion_check is
+		// visible to the descendancy walk. Performing the check here would
+		// reject legitimate "reverse insertion" cases where the new lot is
+		// being introduced as the parent of an existing lot whose path the
+		// new lot will recursively cover.
 
 		for (const auto &path : paths) {
 			storage.replace(db::create_path_record(lot_name, path));
@@ -984,38 +977,158 @@ std::pair<bool, std::string> Lot::store_updates(const std::string &update_stmt,
 }
 
 std::pair<bool, std::string> Lot::check_path_temporal_overlap(const std::string &lot_name,
-															  const std::string &normalized_path, int64_t creation_time,
-															  int64_t expiration_time) {
-	// Single JOIN query replaces the previous N+1 pattern (one SELECT for
-	// candidate lots, plus one get_pointer per candidate). The non-expiring
-	// sentinel (all timestamps = 0) is treated as an interval covering all
-	// time, so a sentinel lot on either side of the comparison always
-	// overlaps the other.
-	std::string query = "SELECT p.lot_name, mpa.creation_time, mpa.expiration_time "
-						"FROM paths p "
-						"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
-						"WHERE p.path = ?1 AND p.lot_name != ?2 AND p.exclude = 0 "
-						"AND ((mpa.creation_time = 0 AND mpa.expiration_time = 0) "
-						"     OR (?3 = 0 AND ?4 = 0) "
-						"     OR (?3 < mpa.expiration_time AND mpa.creation_time < ?4)) "
-						"LIMIT 1;";
-	std::map<std::string, std::vector<int>> str_map{{normalized_path, {1}}, {lot_name, {2}}};
-	std::map<int64_t, std::vector<int>> int_map{{creation_time, {3}}, {expiration_time, {4}}};
-	auto rp = db::SQL_get_matches_multi_col(query, 3, str_map, int_map);
-
+															  const std::string &normalized_path, bool recursive,
+															  int64_t creation_time, int64_t expiration_time) {
+	// Find every live, non-excluded path on a different lot that potentially
+	// conflicts with the candidate path. Three classes of conflict are
+	// considered (see header docstring for the full rule statement):
+	//   (1) EXACT: another lot owns exactly `normalized_path`.
+	//   (2) PREFIX-IN: another lot owns a strict prefix of `normalized_path`
+	//       with `recursive=1`.
+	//   (3) PREFIX-OUT: the candidate is recursive AND another lot owns a
+	//       strict suffix-extension of `normalized_path` (any recursive flag).
+	//
+	// SQL filters narrow the candidate set; classification + descendancy
+	// resolution are done in C++ for clarity. The non-expiring sentinel
+	// (creation=expiration=0) represents an interval covering all time on
+	// either side of the comparison.
+	std::string query =
+		"SELECT p.lot_name, p.path, p.recursive, mpa.creation_time, mpa.expiration_time "
+		"FROM paths p "
+		"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
+		"WHERE p.lot_name != ?1 AND p.exclude = 0 "
+		"AND ((mpa.creation_time = 0 AND mpa.expiration_time = 0) "
+		"     OR (?2 = 0 AND ?3 = 0) "
+		"     OR (?2 < mpa.expiration_time AND mpa.creation_time < ?3)) "
+		"AND ( "
+		// Prefix matching uses substr() rather than LIKE so that path strings
+		// containing SQLite wildcard characters ('%' or '_') compare literally.
+		// LIKE with '|| %' would otherwise classify e.g. '/foo_bar/' as a
+		// prefix of '/fooXbar/anything/'.
+		"  p.path = ?4 "																	  // (1) exact
+		"  OR (p.recursive = 1 AND p.path != ?4 AND substr(?4, 1, length(p.path)) = p.path) " // (2) prefix-in
+		"  OR (?5 = 1 AND p.path != ?4 AND substr(p.path, 1, length(?4)) = ?4) " // (3) prefix-out (candidate recursive)
+		");";
+	std::map<std::string, std::vector<int>> str_map{{lot_name, {1}}, {normalized_path, {4}}};
+	std::map<int64_t, std::vector<int>> int_map{
+		{creation_time, {2}}, {expiration_time, {3}}, {static_cast<int64_t>(recursive ? 1 : 0), {5}}};
+	auto rp = db::SQL_get_matches_multi_col(query, 5, str_map, int_map);
 	if (!rp.second.empty()) {
 		return std::make_pair(false, "Temporal overlap check failed: " + rp.second);
 	}
 
-	if (!rp.first.empty()) {
-		const auto &row = rp.first[0];
-		return std::make_pair(false, "Path '" + normalized_path + "' has a temporal overlap with lot '" + row[0] +
-										 "'. Time ranges (treated as half-open intervals [start, end)) overlap: [" +
-										 std::to_string(creation_time) + ", " + std::to_string(expiration_time) +
-										 ") vs [" + row[1] + ", " + row[2] + ").");
+	for (const auto &row : rp.first) {
+		const std::string &other_lot = row[0];
+		const std::string &other_path = row[1];
+		bool other_recursive = (!row[2].empty() && row[2] != "0");
+
+		if (other_path == normalized_path) {
+			// (1) Exact collision is always rejected.
+			return std::make_pair(false, "Path '" + normalized_path + "' has a temporal overlap with lot '" +
+											 other_lot +
+											 "'. Time ranges (treated as half-open intervals [start, end)) overlap: [" +
+											 std::to_string(creation_time) + ", " + std::to_string(expiration_time) +
+											 ") vs [" + row[3] + ", " + row[4] + ").");
+		}
+
+		// At this point other_path != normalized_path, so it is either a
+		// strict prefix of the candidate or a strict suffix-extension.
+		if (other_path.size() < normalized_path.size()) {
+			// (2) PREFIX-IN: other lot recursively owns a parent of the
+			// candidate path. Allowed only if the candidate lot is a
+			// recursive descendant of the other lot. The SQL guarantees
+			// other_recursive=1 here, but assert defensively.
+			if (!other_recursive) {
+				continue;
+			}
+			auto anc_rp = is_recursive_ancestor(other_lot, lot_name);
+			if (!anc_rp.second.empty()) {
+				return std::make_pair(false, "Descendancy lookup failed while validating path '" + normalized_path +
+												 "' against lot '" + other_lot + "': " + anc_rp.second);
+			}
+			if (!anc_rp.first) {
+				return std::make_pair(
+					false, "Descendancy violation: path '" + normalized_path + "' falls under lot '" + other_lot +
+							   "' which recursively owns the strict prefix '" + other_path +
+							   "' during an overlapping time window. The candidate lot '" + lot_name +
+							   "' must be a sublot (recursive descendant) of '" + other_lot + "' to claim this path.");
+			}
+		} else {
+			// (3) PREFIX-OUT: the candidate is recursive and the other lot
+			// owns a strict subpath. Allowed only if the other lot is a
+			// recursive descendant of the candidate lot. The SQL guarantees
+			// the candidate's recursive flag is true here.
+			if (!recursive) {
+				continue;
+			}
+			auto anc_rp = is_recursive_ancestor(lot_name, other_lot);
+			if (!anc_rp.second.empty()) {
+				return std::make_pair(false, "Descendancy lookup failed while validating path '" + normalized_path +
+												 "' against lot '" + other_lot + "': " + anc_rp.second);
+			}
+			if (!anc_rp.first) {
+				return std::make_pair(
+					false, "Descendancy violation: candidate recursive path '" + normalized_path + "' on lot '" +
+							   lot_name + "' would cover existing path '" + other_path + "' on lot '" + other_lot +
+							   "' during an overlapping time window. '" + other_lot +
+							   "' must be a sublot (recursive descendant) of '" + lot_name + "' for this assignment.");
+			}
+		}
 	}
 
 	return std::make_pair(true, "");
+}
+
+std::pair<bool, std::string> Lot::is_recursive_ancestor(const std::string &ancestor, const std::string &descendant) {
+	if (ancestor == descendant) {
+		return std::make_pair(false, "");
+	}
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		using namespace sqlite_orm;
+
+		// Prefetch every (child -> parent) edge in a single query, then BFS
+		// in memory. The previous implementation issued one SELECT per visited
+		// node, producing O(depth) round-trips per ancestry check;
+		// check_path_temporal_overlap calls this once per candidate conflict,
+		// multiplying that cost. Self-parent rows (lot_name == parent) are
+		// ignored to avoid trivial loops.
+		std::unordered_map<std::string, std::vector<std::string>> parents_of;
+		for (const auto &edge : storage.get_all<db::Parent>()) {
+			if (edge.lot_name == edge.parent) {
+				continue;
+			}
+			parents_of[edge.lot_name].push_back(edge.parent);
+		}
+
+		std::vector<std::string> frontier{descendant};
+		std::unordered_set<std::string> visited;
+		visited.insert(descendant);
+		while (!frontier.empty()) {
+			std::vector<std::string> next;
+			for (const auto &node : frontier) {
+				auto it = parents_of.find(node);
+				if (it == parents_of.end()) {
+					continue;
+				}
+				for (const auto &p : it->second) {
+					if (p == ancestor) {
+						return std::make_pair(true, "");
+					}
+					if (visited.insert(p).second) {
+						next.push_back(p);
+					}
+				}
+			}
+			frontier = std::move(next);
+		}
+		return std::make_pair(false, "");
+	} catch (const std::exception &e) {
+		// Surface the underlying error to the caller; "ancestor unknown" is
+		// not a safe stand-in because it would be reported as a descendancy
+		// violation, which is misleading.
+		return std::make_pair(false, std::string("storage error: ") + e.what());
+	}
 }
 
 std::pair<bool, std::string> Lot::store_new_parents(const std::vector<Lot> &new_parents) {

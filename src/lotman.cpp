@@ -449,7 +449,8 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 			}
 
 			if (update_JSON_obj.contains("parents")) {
-				if (!lot.update_parents_in_txn(update_JSON_obj["parents"], txn_error)) {
+				if (!lot.update_parents_in_txn(update_JSON_obj["parents"], txn_error,
+											   /*revalidate_paths=*/false)) {
 					txn_error = "Failed on call to lot.update_parents: " + txn_error;
 					return false;
 				}
@@ -526,6 +527,19 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 			if (update_JSON_obj.contains("parent_attributions")) {
 				if (!lot.update_attributions_in_txn(update_JSON_obj["parent_attributions"], txn_error)) {
 					txn_error = "Failed on call to lot.update_attributions: " + txn_error;
+					return false;
+				}
+			}
+
+			// Final descendancy revalidation against the fully-committed
+			// state of this transaction. update_parents_in_txn was asked to
+			// skip its inline revalidation so that simultaneous parent +
+			// path edits are evaluated against the final ancestry rather
+			// than an intermediate state. We only need to revalidate when
+			// the caller actually touched parents or paths;
+			// revalidate_paths_in_txn itself is a no-op for the default lot.
+			if (update_JSON_obj.contains("parents") || update_JSON_obj.contains("paths")) {
+				if (!lot.revalidate_paths_in_txn(txn_error)) {
 					return false;
 				}
 			}

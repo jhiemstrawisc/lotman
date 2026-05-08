@@ -2232,14 +2232,17 @@ TEST_F(LotManTest, PathExclusionTest) {
 	EXPECT_EQ(final_paths_json[0]["path"], "/test/path/");
 
 	// Edge case: Test exclusion path that is a prefix of another valid path
-	// e.g., exclude /data/cache but /data/cachedata should NOT be excluded
+	// e.g., exclude /pdata/cache but /pdata/cachedata should NOT be excluded.
+	// Uses a /pdata root rather than /data so the recursive coverage does
+	// not collide with exclusion_lot's existing /data/storage claim under
+	// the dynamic-ownership descendancy rule.
 	const char *prefix_lot = R"({
 		"lot_name": "prefix_test_lot",
 		"owner": "owner1",
 		"parents": ["lot1"],
 		"paths": [
-			{"path": "/data", "recursive": true, "exclude": false},
-			{"path": "/data/cache", "recursive": true, "exclude": true}
+			{"path": "/pdata", "recursive": true, "exclude": false},
+			{"path": "/pdata/cache", "recursive": true, "exclude": true}
 		],
 		"management_policy_attrs": {
 			"dedicated_GB": 5,
@@ -2255,28 +2258,28 @@ TEST_F(LotManTest, PathExclusionTest) {
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << "Failed to add prefix test lot: " << err_msg.get();
 
-	// /data/cache should be excluded
+	// /pdata/cache should be excluded
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/cache", false, 150, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/pdata/cache", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
-	EXPECT_STREQ(lots_output[0], "default") << "/data/cache should be excluded";
+	EXPECT_STREQ(lots_output[0], "default") << "/pdata/cache should be excluded";
 	lotman_free_string_list(lots_output);
 
-	// /data/cachedata should NOT be excluded (different path, just happens to have "cache" prefix)
+	// /pdata/cachedata should NOT be excluded (different path, just happens to have "cache" prefix)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/cachedata", false, 150, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/pdata/cachedata", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
-	EXPECT_STREQ(lots_output[0], "prefix_test_lot") << "/data/cachedata should NOT be excluded (different path)";
+	EXPECT_STREQ(lots_output[0], "prefix_test_lot") << "/pdata/cachedata should NOT be excluded (different path)";
 	lotman_free_string_list(lots_output);
 
-	// /data/cache/subdir should be excluded (under recursive exclusion)
+	// /pdata/cache/subdir should be excluded (under recursive exclusion)
 	lots_output = nullptr;
-	rv = lotman_get_lots_from_dir("/data/cache/subdir", false, 150, &lots_output, &raw_err);
+	rv = lotman_get_lots_from_dir("/pdata/cache/subdir", false, 150, &lots_output, &raw_err);
 	err_msg.reset(raw_err);
 	ASSERT_EQ(rv, 0) << err_msg.get();
-	EXPECT_STREQ(lots_output[0], "default") << "/data/cache/subdir should be excluded";
+	EXPECT_STREQ(lots_output[0], "default") << "/pdata/cache/subdir should be excluded";
 	lotman_free_string_list(lots_output);
 }
 

@@ -84,7 +84,7 @@ inline json new_lot_schema = []() {
                     },
                     "exclude": {
                         "type": "boolean",
-                        "description": "If true, this path is excluded from the lot's tracking"
+                        "description": "Escape hatch: when true, this path row is ignored by both path-to-lot resolution and the descendancy/temporal overlap check. Prefer the dynamic-ownership model (a sublot whose path is a strict subpath of an ancestor's recursive path automatically claims its subtree) over explicit exclusions."
                     }
                 },
                 "required": ["path", "recursive"]
@@ -342,7 +342,7 @@ inline json lot_additions_schema = []() {
                     },
                     "exclude": {
                         "type": "boolean",
-                        "description": "If true, this path is excluded from the lot's tracking"
+                        "description": "Escape hatch: when true, this path row is ignored by both path-to-lot resolution and the descendancy/temporal overlap check. Prefer the dynamic-ownership model (a sublot whose path is a strict subpath of an ancestor's recursive path automatically claims its subtree) over explicit exclusions."
                     }
                 },
                 "required": ["path", "recursive"]
