@@ -1265,7 +1265,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	char **raw_output = nullptr;
 
 	// Check for lots past expiration
-	auto rv = lotman_get_lots_past_exp(true, &raw_output, &raw_err);
+	auto rv = lotman_get_lots_past_exp(true, /*include_reclaimed=*/true, &raw_output, &raw_err);
 	UniqueCString err_msg(raw_err);
 	UniqueStringList output(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1281,7 +1281,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past deletion
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_del(true, &raw_output, &raw_err);
+	rv = lotman_get_lots_past_del(true, /*include_reclaimed=*/true, &raw_output, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output2(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1297,7 +1297,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past opportunistic storage limit
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_opp(true, true, &raw_output, false, &raw_err);
+	rv = lotman_get_lots_past_opp(true, true, /*include_reclaimed=*/true, &raw_output, false, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output3(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1313,7 +1313,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past dedicated storage limit
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_ded(true, true, &raw_output, false, &raw_err);
+	rv = lotman_get_lots_past_ded(true, true, /*include_reclaimed=*/true, &raw_output, false, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output4(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1329,7 +1329,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past object storage limit
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_obj(true, true, &raw_output, false, &raw_err);
+	rv = lotman_get_lots_past_obj(true, true, /*include_reclaimed=*/true, &raw_output, false, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output5(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();

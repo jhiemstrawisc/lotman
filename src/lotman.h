@@ -696,7 +696,59 @@ void lotman_free_string_list(char **str_list);
 		The array to be freed.
 */
 
-int lotman_get_lots_past_exp(const bool recursive, char ***output, char **err_msg);
+#ifndef LOTMAN_RECLAIM_ERROR
+#define LOTMAN_RECLAIM_ERROR -1
+#endif
+#ifndef LOTMAN_RECLAIM_OK
+#define LOTMAN_RECLAIM_OK 0
+#endif
+#ifndef LOTMAN_RECLAIM_ALREADY_RECLAIMED
+#define LOTMAN_RECLAIM_ALREADY_RECLAIMED 1
+#endif
+
+int lotman_reclaim_lot(const char *lot_name, int64_t reclaimed_at, const char *reason, char **err_msg);
+/**
+	DESCRIPTION: Records a reclamation ledger entry for the named lot and every descendant in its
+		subtree, marking them as reclaimed by the storage provider. LotMan does NOT delete reclaimed
+		lots or modify their MPAs/usage; the reclamation is purely a fact recorded in a `reclamations`
+		ledger table. The intent is to let the caller (typically a storage provider's cleanup loop)
+		record the moment it is no longer attributing the underlying bytes/objects to the lot, so
+		subsequent calls to `lotman_get_lots_past_*` (with include_reclaimed=false) skip the lot,
+		capacity and Axiom-2 calculations exclude it, dir-based usage updates suppress its self-write,
+		and most mutating APIs reject writes against it. The default lot may not be reclaimed.
+
+		Already-reclaimed lots in the subtree are treated as no-ops, regardless of the existing
+		(reclaimed_at, reason) tuple. The existing ledger row is never overwritten. This lets a
+		cascade continue when one descendant has already been reclaimed while still recording rows
+		for any unreclaimed descendants. If a real write/storage error occurs for any unreclaimed
+		lot, the entire batch rolls back.
+
+		Authorization: caller must own the named lot in the same sense as `lotman_remove_lots_recursive`
+		(ownership of any of its parents). Authorization to the root authorizes the cascade.
+
+	RETURNS: Returns LOTMAN_RECLAIM_OK (0) when at least one reclamation row was added,
+		LOTMAN_RECLAIM_ALREADY_RECLAIMED (1) when every target already had a reclamation row and
+		no new row was added, or LOTMAN_RECLAIM_ERROR (-1) on validation, authorization, or storage
+		failure.
+
+	INPUTS:
+	lot_name:
+		The root of the subtree to reclaim. The named lot and every descendant get one ledger
+		row each. Must not be the default lot.
+
+	reclaimed_at:
+		A Unix timestamp in milliseconds. Must be > 0. May be in the future to schedule a
+		reclamation; reclamation-aware filters use `reclaimed_at <= now` so future-dated rows
+		do not take effect until their time arrives.
+
+	reason:
+		Free-form text recorded alongside the ledger row. May be empty. Not validated.
+
+	err_msg:
+		A reference to a char array that can store any error messages.
+*/
+
+int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their expiration.
 		The function can determine which lots meet this criteria either by looking at the expiration
@@ -711,6 +763,12 @@ int lotman_get_lots_past_exp(const bool recursive, char ***output, char **err_ms
 		passed (recursive = false) or it should contain all lots who may also have an expired parent
 		(recursive = true).
 
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. When false (the typical use
+		case for cleanup loops), reclaimed lots are filtered out so the loop will not repeatedly
+		process lots that the storage provider has already cleaned up.
+
 	output:
 		A reference to a char ** for storing an array of expired lot names.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
@@ -719,7 +777,7 @@ int lotman_get_lots_past_exp(const bool recursive, char ***output, char **err_ms
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_msg);
+int lotman_get_lots_past_del(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their deletion time.
 		The function can determine which lots meet this criteria either by looking at the deletion time
@@ -734,6 +792,11 @@ int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_ms
 		passed (recursive = false) or it should contain all lots who may also have a parent passed its
 		deletion time (recursive = true).
 
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		pass false so they do not repeatedly process lots that have already been reclaimed.
+
 	output:
 		A reference to a char ** for storing an array of lots passed their deletion time.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
@@ -742,8 +805,8 @@ int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_ms
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, char ***output,
-							 const bool hierarchical, char **err_msg);
+int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
+							 char ***output, const bool hierarchical, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their opportunistic storage.
 		The function can determine which lots meet this criteria either by looking at the opportunistic storage
@@ -752,7 +815,7 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
-	INPUTS:
+	INPUTS (in declaration order):
 	recursive_quota:
 		A boolean indicating whether quotas should be treated recursively, ie whether the usage of a lot's children
 		should be counted against its own usage (recursive_quota = true) or whether only a lot's personal usage
@@ -763,6 +826,15 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 		be useful to also treat these children as offending lots.
 		NOTE: The children generated when recursive_children is true will include all recursive children of the lot,
 		not just immediate children.
+
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		pass false to avoid repeatedly processing lots that have already been reclaimed.
+		NOTE: When hierarchical = true, reclaimed parents are excluded from the result
+		unconditionally (regardless of include_reclaimed) because their storage has been
+		released to the default lot and they cannot meaningfully be "past" their own quota.
+		include_reclaimed only governs post-filtering on the non-hierarchical path.
 
 	output:
 		A reference to a char ** for storing an array of lots passed their opportunistic storage quota.
@@ -779,8 +851,8 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, char ***output,
-							 const bool hierarchical, char **err_msg);
+int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
+							 char ***output, const bool hierarchical, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their dedicated storage.
 		The function can determine which lots meet this criteria either by looking at the dedicated storage
@@ -789,7 +861,7 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
-	INPUTS:
+	INPUTS (in declaration order):
 	recursive_quota:
 		A boolean indicating whether quotas should be treated recursively, ie whether the usage of a lot's children
 		should be counted against its own usage (recursive_quota = true) or whether only a lot's personal usage
@@ -800,6 +872,15 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 		be useful to also treat these children as offending lots.
 		NOTE: The children generated when recursive_children is true will include all recursive children of the lot,
 		not just immediate children.
+
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		pass false to avoid repeatedly processing lots that have already been reclaimed.
+		NOTE: When hierarchical = true, reclaimed parents are excluded from the result
+		unconditionally (regardless of include_reclaimed) because their storage has been
+		released to the default lot and they cannot meaningfully be "past" their own quota.
+		include_reclaimed only governs post-filtering on the non-hierarchical path.
 
 	output:
 		A reference to a char ** for storing an array of lots passed their dedicated storage quota.
@@ -816,8 +897,8 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, char ***output,
-							 const bool hierarchical, char **err_msg);
+int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
+							 char ***output, const bool hierarchical, char **err_msg);
 /**
 	DESCRIPTION: A function for determining all lots in the database that are past their object storage quota.
 		The function can determine which lots meet this criteria either by looking at the object storage quota
@@ -826,7 +907,7 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
-	INPUTS:
+	INPUTS (in declaration order):
 	recursive_quota:
 		A boolean indicating whether quotas should be treated recursively, ie whether the usage of a lot's children
 		should be counted against its own usage (recursive_quota = true) or whether only a lot's personal usage
@@ -838,8 +919,17 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 		NOTE: The children generated when recursive_children is true will include all recursive children of the lot,
 		not just immediate children.
 
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		pass false to avoid repeatedly processing lots that have already been reclaimed.
+		NOTE: When hierarchical = true, reclaimed parents are excluded from the result
+		unconditionally (regardless of include_reclaimed) because their storage has been
+		released to the default lot and they cannot meaningfully be "past" their own quota.
+		include_reclaimed only governs post-filtering on the non-hierarchical path.
+
 	output:
-		A reference to a char ** for storing an array of lots passed their opportunistic storage quota.
+		A reference to a char ** for storing an array of lots passed their max object count quota.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
 
 	hierarchical:
@@ -865,6 +955,10 @@ int lotman_get_available_capacity(const char *parent_lot_name, int64_t start_tim
 		enforcement is performed atomically by Axiom 2 inside the lot-creation transaction
 		when strict_hierarchy is enabled, so another caller may legitimately claim capacity
 		between this query and the subsequent create.
+
+		Reclaimed children (rows in the `reclamations` ledger whose `reclaimed_at <= now`) are
+		silently excluded from the sweep -- their attributed capacity is treated as freed and
+		no longer counted against the parent.
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
@@ -971,6 +1065,11 @@ for the 'recursive' flag. When recursive is true, each MPA will contain a JSON o
 		Values are absolute MPA shares (not fractions), so a create-then-read round-trip is symmetric. Unbounded
 		child axes (-1 sentinel) propagate to each parent as -1. For self-parent-only lots (i.e. lots with no
 		non-self parents), this field is an empty object.
+	"reclamation":
+		OPTIONAL. Present only when a reclamation ledger row exists for the lot. A JSON object of the
+		form {"reclaimed_at": <int64 ms>, "reason": <string>}. When `reclaimed_at <= now`, the lot is
+		effectively reclaimed; when `reclaimed_at > now`, the row represents a scheduled reclamation
+		that has not yet taken effect.
 }
 */
 
@@ -989,6 +1088,12 @@ int lotman_get_lots_from_dir(const char *dir, const bool recursive, int64_t quer
 	recursive:
 		A boolean indicating whether only the lot tracking the path should be returned (recursive = false),
 		or whether all parent lots should also be returned (recursive = true).
+
+	query_time:
+		A Unix timestamp in milliseconds used to filter active path/lot rows: a lot is considered active
+		when its MPA window contains `query_time` and any reclamation row for it has `reclaimed_at >
+		query_time`. Passing the current wall-clock time yields the live-as-of-now view; reclaimed lots
+		are therefore filtered out.
 
 	output:
 		A reference to a char ** for storing the output array.

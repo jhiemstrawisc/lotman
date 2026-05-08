@@ -271,10 +271,20 @@ class Lot {
 														  const bool assign_policy_to_children);
 	void init_self_usage();
 	static std::pair<bool, std::string> lot_exists(const std::string &lot_name);
+	// Returns {true, ""} iff a reclamation row exists for `lot_name` and its
+	// `reclaimed_at` is at or before `query_time` (ms since epoch). A future
+	// reclaimed_at is treated as not-yet-reclaimed. The error string is non-
+	// empty only on lookup failure (in which case the bool is false).
+	static std::pair<bool, std::string> is_reclaimed(const std::string &lot_name, int64_t query_time);
 	std::pair<bool, std::string> check_if_root();
 	std::pair<bool, std::string> store_lot(const json &parent_attributions_json = json());
 	std::pair<bool, std::string> destroy_lot();
 	std::pair<bool, std::string> destroy_lot_recursive();
+	// Reclaim this lot and all descendants atomically. Already-reclaimed lots are
+	// skipped without overwriting their existing ledger row. Returns 0 when at
+	// least one row was added, 1 when every target was already reclaimed, and -1
+	// on real failure. Caller is responsible for authorizing against the root.
+	std::pair<int, std::string> reclaim_lot_with_descendants(int64_t reclaimed_at, const std::string &reason);
 
 	std::pair<std::vector<Lot>, std::string> get_children(const bool recursive = false, const bool get_self = false);
 
@@ -327,6 +337,19 @@ class Lot {
 															bool include_self = false);
 	std::pair<bool, std::string> check_context_for_children(const std::vector<Lot> &children,
 															bool include_self = false);
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_exp(const bool recursive,
+																			  const bool include_reclaimed);
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_del(const bool recursive,
+																			  const bool include_reclaimed);
+	static std::pair<std::vector<std::string>, std::string>
+	get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed);
+	static std::pair<std::vector<std::string>, std::string>
+	get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed);
+	static std::pair<std::vector<std::string>, std::string>
+	get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed);
+
+	// Internal "no-filter" overloads kept for the include_reclaimed=true path
+	// and reused by the include_reclaimed-aware overloads above.
 	static std::pair<std::vector<std::string>, std::string> get_lots_past_exp(const bool recursive);
 	static std::pair<std::vector<std::string>, std::string> get_lots_past_del(const bool recursive);
 	static std::pair<std::vector<std::string>, std::string> get_lots_past_opp(const bool recursive_quota,
@@ -341,12 +364,18 @@ class Lot {
 	// NOTE: When hierarchical=true, recursive_quota and recursive_children are
 	// not used — the hierarchical SQL query has its own built-in logic.
 	// They are only forwarded to the non-hierarchical path when hierarchical=false.
-	static std::pair<std::vector<std::string>, std::string>
-	get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool hierarchical);
-	static std::pair<std::vector<std::string>, std::string>
-	get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool hierarchical);
-	static std::pair<std::vector<std::string>, std::string>
-	get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool hierarchical);
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_opp(const bool recursive_quota,
+																			  const bool recursive_children,
+																			  const bool include_reclaimed,
+																			  const bool hierarchical);
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_ded(const bool recursive_quota,
+																			  const bool recursive_children,
+																			  const bool include_reclaimed,
+																			  const bool hierarchical);
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_obj(const bool recursive_quota,
+																			  const bool recursive_children,
+																			  const bool include_reclaimed,
+																			  const bool hierarchical);
 
 	// Strict hierarchy validation methods
 	static std::pair<bool, std::string> validate_axiom1(const std::string &child_lot_name);
