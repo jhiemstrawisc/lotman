@@ -1001,9 +1001,13 @@ std::pair<bool, std::string> Lot::check_path_temporal_overlap(const std::string 
 		"     OR (?2 = 0 AND ?3 = 0) "
 		"     OR (?2 < mpa.expiration_time AND mpa.creation_time < ?3)) "
 		"AND ( "
-		"  p.path = ?4 "													 // (1) exact
-		"  OR (p.recursive = 1 AND p.path != ?4 AND ?4 LIKE p.path || '%') " // (2) prefix-in
-		"  OR (?5 = 1 AND p.path != ?4 AND p.path LIKE ?4 || '%') " // (3) prefix-out (only if candidate recursive)
+		// Prefix matching uses substr() rather than LIKE so that path strings
+		// containing SQLite wildcard characters ('%' or '_') compare literally.
+		// LIKE with '|| %' would otherwise classify e.g. '/foo_bar/' as a
+		// prefix of '/fooXbar/anything/'.
+		"  p.path = ?4 "																	  // (1) exact
+		"  OR (p.recursive = 1 AND p.path != ?4 AND substr(?4, 1, length(p.path)) = p.path) " // (2) prefix-in
+		"  OR (?5 = 1 AND p.path != ?4 AND substr(p.path, 1, length(?4)) = ?4) " // (3) prefix-out (candidate recursive)
 		");";
 	std::map<std::string, std::vector<int>> str_map{{lot_name, {1}}, {normalized_path, {4}}};
 	std::map<int64_t, std::vector<int>> int_map{
@@ -1083,18 +1087,31 @@ std::pair<bool, std::string> Lot::is_recursive_ancestor(const std::string &ances
 		auto &storage = db::StorageManager::get_storage();
 		using namespace sqlite_orm;
 
-		// BFS up from `descendant` looking for `ancestor`. The parents table
-		// maps child→parent edges; self-parent rows (lot_name == parent) are
+		// Prefetch every (child -> parent) edge in a single query, then BFS
+		// in memory. The previous implementation issued one SELECT per visited
+		// node, producing O(depth) round-trips per ancestry check;
+		// check_path_temporal_overlap calls this once per candidate conflict,
+		// multiplying that cost. Self-parent rows (lot_name == parent) are
 		// ignored to avoid trivial loops.
+		std::unordered_map<std::string, std::vector<std::string>> parents_of;
+		for (const auto &edge : storage.get_all<db::Parent>()) {
+			if (edge.lot_name == edge.parent) {
+				continue;
+			}
+			parents_of[edge.lot_name].push_back(edge.parent);
+		}
+
 		std::vector<std::string> frontier{descendant};
 		std::unordered_set<std::string> visited;
 		visited.insert(descendant);
 		while (!frontier.empty()) {
 			std::vector<std::string> next;
 			for (const auto &node : frontier) {
-				auto parents = storage.select(
-					&db::Parent::parent, where(c(&db::Parent::lot_name) == node and c(&db::Parent::parent) != node));
-				for (auto &p : parents) {
+				auto it = parents_of.find(node);
+				if (it == parents_of.end()) {
+					continue;
+				}
+				for (const auto &p : it->second) {
 					if (p == ancestor) {
 						return std::make_pair(true, "");
 					}

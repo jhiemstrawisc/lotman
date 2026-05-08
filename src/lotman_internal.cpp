@@ -1771,7 +1771,9 @@ bool lotman::Lot::update_paths_in_txn(const json &update_arr, std::string &txn_e
 			auto path_record = rows[0];
 
 			// Apply field updates
-			path_record.recursive = update_obj["recursive"].get<int>();
+			int new_recursive = update_obj["recursive"].get<int>();
+			bool recursive_changed = (path_record.recursive != new_recursive);
+			path_record.recursive = new_recursive;
 			bool exclude_changed_to_false = false;
 			if (update_obj.contains("exclude")) {
 				int new_exclude = update_obj["exclude"].get<int>();
@@ -1781,9 +1783,16 @@ bool lotman::Lot::update_paths_in_txn(const json &update_arr, std::string &txn_e
 				path_record.exclude = new_exclude;
 			}
 
-			// Check temporal overlap if: (1) path changes, OR (2) exclude flips true→false
-			// In case (2), a previously-excluded path becomes active and might conflict
-			if (current_path != new_path || exclude_changed_to_false) {
+			// Re-check temporal overlap if any state change can introduce a
+			// new conflict against the rest of the DB:
+			//   (1) the path string itself changed,
+			//   (2) exclude flipped true -> false (a previously dormant row
+			//       becomes active), or
+			//   (3) the recursive flag toggled. Under the dynamic-ownership
+			//       rules a flip can introduce or relieve PREFIX-IN /
+			//       PREFIX-OUT conflicts even when the path string and
+			//       exclude flag are unchanged.
+			if (current_path != new_path || exclude_changed_to_false || recursive_changed) {
 				// Check temporal overlap for the path (if not excluded)
 				if (!path_record.exclude) {
 					auto this_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(lot_name);
