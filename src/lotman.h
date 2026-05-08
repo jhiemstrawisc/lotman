@@ -815,7 +815,7 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
-	INPUTS:
+	INPUTS (in declaration order):
 	recursive_quota:
 		A boolean indicating whether quotas should be treated recursively, ie whether the usage of a lot's children
 		should be counted against its own usage (recursive_quota = true) or whether only a lot's personal usage
@@ -827,6 +827,15 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 		NOTE: The children generated when recursive_children is true will include all recursive children of the lot,
 		not just immediate children.
 
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		pass false to avoid repeatedly processing lots that have already been reclaimed.
+		NOTE: When hierarchical = true, reclaimed parents are excluded from the result
+		unconditionally (regardless of include_reclaimed) because their storage has been
+		released to the default lot and they cannot meaningfully be "past" their own quota.
+		include_reclaimed only governs post-filtering on the non-hierarchical path.
+
 	output:
 		A reference to a char ** for storing an array of lots passed their opportunistic storage quota.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
@@ -837,11 +846,6 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 		(usage exceeding the child's own threshold). Results are returned depth-ordered
 		(deepest/leaf lots first). When true, recursive_quota and recursive_children
 		are not used by the hierarchical query path.
-
-	include_reclaimed:
-		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
-		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
-		pass false to avoid repeatedly processing lots that have already been reclaimed.
 
 	err_msg:
 		A reference to a char array that can store any error messages.
@@ -857,7 +861,7 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
-	INPUTS:
+	INPUTS (in declaration order):
 	recursive_quota:
 		A boolean indicating whether quotas should be treated recursively, ie whether the usage of a lot's children
 		should be counted against its own usage (recursive_quota = true) or whether only a lot's personal usage
@@ -869,6 +873,15 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 		NOTE: The children generated when recursive_children is true will include all recursive children of the lot,
 		not just immediate children.
 
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		pass false to avoid repeatedly processing lots that have already been reclaimed.
+		NOTE: When hierarchical = true, reclaimed parents are excluded from the result
+		unconditionally (regardless of include_reclaimed) because their storage has been
+		released to the default lot and they cannot meaningfully be "past" their own quota.
+		include_reclaimed only governs post-filtering on the non-hierarchical path.
+
 	output:
 		A reference to a char ** for storing an array of lots passed their dedicated storage quota.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
@@ -879,11 +892,6 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 		(usage exceeding the child's own threshold). Results are returned depth-ordered
 		(deepest/leaf lots first). When true, recursive_quota and recursive_children
 		are not used by the hierarchical query path.
-
-	include_reclaimed:
-		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
-		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
-		pass false to avoid repeatedly processing lots that have already been reclaimed.
 
 	err_msg:
 		A reference to a char array that can store any error messages.
@@ -899,7 +907,7 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
-	INPUTS:
+	INPUTS (in declaration order):
 	recursive_quota:
 		A boolean indicating whether quotas should be treated recursively, ie whether the usage of a lot's children
 		should be counted against its own usage (recursive_quota = true) or whether only a lot's personal usage
@@ -911,6 +919,15 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 		NOTE: The children generated when recursive_children is true will include all recursive children of the lot,
 		not just immediate children.
 
+	include_reclaimed:
+		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
+		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		pass false to avoid repeatedly processing lots that have already been reclaimed.
+		NOTE: When hierarchical = true, reclaimed parents are excluded from the result
+		unconditionally (regardless of include_reclaimed) because their storage has been
+		released to the default lot and they cannot meaningfully be "past" their own quota.
+		include_reclaimed only governs post-filtering on the non-hierarchical path.
+
 	output:
 		A reference to a char ** for storing an array of lots passed their max object count quota.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
@@ -921,11 +938,6 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 		(usage exceeding the child's own threshold). Results are returned depth-ordered
 		(deepest/leaf lots first). When true, recursive_quota and recursive_children
 		are not used by the hierarchical query path.
-
-	include_reclaimed:
-		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
-		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
-		pass false to avoid repeatedly processing lots that have already been reclaimed.
 
 	err_msg:
 		A reference to a char array that can store any error messages.

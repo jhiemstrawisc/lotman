@@ -570,34 +570,61 @@ std::pair<int, std::string> lotman::Lot::reclaim_lot_with_descendants(int64_t re
 		}
 	}
 
-	auto &storage = db::StorageManager::get_storage();
-	std::string txn_error;
+	// Use a raw INSERT OR IGNORE rather than sqlite_orm's `replace` (which
+	// compiles to INSERT OR REPLACE). The reclamations table is an immutable
+	// ledger: once a row exists for a lot, nothing -- not a retry, not a
+	// concurrent writer -- may overwrite it. INSERT OR IGNORE makes that
+	// invariant a property of the SQL primitive, not of a get-then-write
+	// check that could race. We use sqlite3_changes() to learn whether each
+	// statement actually inserted a row, which doubles as our "skipped
+	// existing" signal. We use BEGIN IMMEDIATE so any conflicting writer is
+	// serialized at the start of the cascade rather than after partial work.
+	db::PooledConnection conn(db::PooledConnection::TransactionType::Immediate);
+	if (!conn.valid()) {
+		return std::make_pair(-1, "Failed to acquire DB connection for reclaim: " + conn.error());
+	}
+
+	const std::string insert_sql =
+		"INSERT OR IGNORE INTO reclamations (lot_name, reclaimed_at, reclaimed_reason) VALUES (?1, ?2, ?3);";
+	auto [stmt, prep_err] = db::PreparedStatementCache::get_or_prepare(conn.get(), insert_sql);
+	if (!stmt) {
+		conn.rollback();
+		return std::make_pair(-1, "Failed to prepare reclaim insert: " + prep_err);
+	}
+	db::CachedStmtGuard stmt_guard(conn.get(), insert_sql, stmt);
+
 	bool inserted_any = false;
 	bool skipped_existing = false;
-	bool committed = storage.transaction([&] {
-		for (const auto &name : targets) {
-			try {
-				auto existing = storage.get_pointer<db::Reclamation>(name);
-				if (existing) {
-					// Existing reclamation rows are authoritative ledger facts. Do not
-					// overwrite them; skip this lot and continue the cascade.
-					skipped_existing = true;
-					continue;
-				}
-				db::Reclamation row{name, reclaimed_at, reason};
-				storage.replace(row);
-				inserted_any = true;
-			} catch (const std::exception &e) {
-				txn_error = std::string("Failed to reclaim lot '") + name + "': " + e.what();
-				return false;
-			}
+	for (const auto &name : targets) {
+		sqlite3_reset(stmt);
+		sqlite3_clear_bindings(stmt);
+		if (sqlite3_bind_text(stmt, 1, name.c_str(), static_cast<int>(name.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
+			sqlite3_bind_int64(stmt, 2, reclaimed_at) != SQLITE_OK ||
+			sqlite3_bind_text(stmt, 3, reason.c_str(), static_cast<int>(reason.size()), SQLITE_TRANSIENT) !=
+				SQLITE_OK) {
+			stmt_guard.discard();
+			conn.rollback();
+			return std::make_pair(-1, std::string("Failed to bind reclaim insert for lot '") + name + "'");
 		}
-		return true;
-	});
-
-	if (!committed) {
-		return std::make_pair(-1, txn_error.empty() ? "Transaction failed" : txn_error);
+		int rc = sqlite3_step(stmt);
+		if (rc != SQLITE_DONE) {
+			stmt_guard.discard();
+			conn.rollback();
+			return std::make_pair(-1, std::string("Failed to execute reclaim insert for lot '") + name +
+										  "': sqlite errno " + std::to_string(rc));
+		}
+		if (sqlite3_changes(conn.get()) > 0) {
+			inserted_any = true;
+		} else {
+			// Row already existed: ledger fact preserved, cascade continues.
+			skipped_existing = true;
+		}
 	}
+
+	if (!conn.commit()) {
+		return std::make_pair(-1, "Failed to commit reclaim transaction: " + conn.error());
+	}
+
 	if (!inserted_any && skipped_existing) {
 		return std::make_pair(1, "All target lots already had reclamation rows; no new row was added.");
 	}
