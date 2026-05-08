@@ -42,6 +42,36 @@ const char *lotman_version() {
 	return version.c_str();
 }
 
+namespace {
+// Returns 0 if `lot_name` is not reclaimed (or the lot does not exist; in
+// which case the caller's lot_exists check handles the not-found error).
+// Returns -1 with err_msg populated when the lot has a reclamation row whose
+// reclaimed_at <= now -- mutating APIs must reject in that case so the
+// historical accounting record is preserved.
+//
+// TODO: Do functions like this need a temporal signature so someone can check reclamation in the future?
+int reject_if_reclaimed(const std::string &lot_name, const char *op, char **err_msg) {
+	auto now = std::chrono::system_clock::now();
+	int64_t now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
+	auto rp = lotman::Lot::is_reclaimed(lot_name, now_ms);
+	if (!rp.second.empty()) {
+		if (err_msg) {
+			std::string msg = std::string("Failure on call to is_reclaimed while attempting ") + op + ": " + rp.second;
+			*err_msg = strdup(msg.c_str());
+		}
+		return -1;
+	}
+	if (rp.first) {
+		if (err_msg) {
+			std::string msg = "Lot '" + lot_name + "' is reclaimed and cannot be modified (operation: " + op + ").";
+			*err_msg = strdup(msg.c_str());
+		}
+		return -1;
+	}
+	return 0;
+}
+} // namespace
+
 int lotman_add_lot(const char *lotman_JSON_str, char **err_msg) {
 	try {
 		json lot_JSON_obj = json::parse(lotman_JSON_str);
@@ -96,6 +126,19 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg) {
 		json parent_attributions;
 		if (lot_JSON_obj.contains("parent_attributions") && !lot_JSON_obj["parent_attributions"].is_null()) {
 			parent_attributions = lot_JSON_obj["parent_attributions"];
+		}
+
+		// Reclamation is a terminal ledger fact: a reclaimed lot's subtree has
+		// been "released" back to the default lot. Adding a live child under a
+		// reclaimed parent would resurrect that subtree and violate the
+		// invariant that reclaimed storage is hoovered into default. Reject.
+		for (const auto &parent_name : lot.parents) {
+			if (parent_name == lot.lot_name) {
+				continue; // Self-parent is a root marker, not an actual ancestor edge.
+			}
+			if (reject_if_reclaimed(parent_name, "lotman_add_lot", err_msg) != 0) {
+				return -1;
+			}
 		}
 
 		// Check for context and make sure caller is allowed to add the lot as specified
@@ -283,6 +326,72 @@ int lotman_remove_lots_recursive(const char *lot_name, char **err_msg) {
 	}
 }
 
+int lotman_reclaim_lot(const char *lot_name, int64_t reclaimed_at, const char *reason, char **err_msg) {
+	try {
+		if (!lot_name) {
+			if (err_msg) {
+				*err_msg = strdup("lot_name must not be a null pointer.");
+			}
+			return -1;
+		}
+		if (reclaimed_at <= 0) {
+			if (err_msg) {
+				*err_msg = strdup("reclaimed_at must be a positive Unix timestamp in milliseconds.");
+			}
+			return -1;
+		}
+		std::string lot_name_s{lot_name};
+		std::string reason_s = reason ? std::string{reason} : std::string{};
+
+		auto rp = lotman::Lot::lot_exists(lot_name_s);
+		if (!rp.first) {
+			if (err_msg) {
+				if (rp.second.empty()) {
+					*err_msg = strdup("Lot does not exist, so it cannot be reclaimed.");
+				} else {
+					std::string int_err = rp.second;
+					std::string ext_err = "Function call to lotman::Lot::lot_exists failed: ";
+					*err_msg = strdup((ext_err + int_err).c_str());
+				}
+			}
+			return -1;
+		}
+
+		lotman::Lot lot(lot_name_s);
+
+		// Authorization: caller must own the lot, defined the same way as
+		// lotman_remove_lots_recursive (caller owns at least one of its parents,
+		// or owns it via self-parent). Authorization to the root authorizes the
+		// cascade.
+		lot.get_parents(true, true);
+		rp = lot.check_context_for_parents(lot.recursive_parents, true);
+		if (!rp.first) {
+			if (err_msg) {
+				std::string int_err = rp.second;
+				std::string ext_err = "Error while checking context for parents: ";
+				*err_msg = strdup((ext_err + int_err).c_str());
+			}
+			return -1;
+		}
+
+		auto reclaim_rp = lot.reclaim_lot_with_descendants(reclaimed_at, reason_s);
+		if (reclaim_rp.first == LOTMAN_RECLAIM_ERROR) {
+			if (err_msg) {
+				std::string int_err = reclaim_rp.second;
+				std::string ext_err = "Failed to reclaim lot: ";
+				*err_msg = strdup((ext_err + int_err).c_str());
+			}
+			return LOTMAN_RECLAIM_ERROR;
+		}
+		return reclaim_rp.first;
+	} catch (std::exception &exc) {
+		if (err_msg) {
+			*err_msg = strdup(exc.what());
+		}
+		return LOTMAN_RECLAIM_ERROR;
+	}
+}
+
 int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 	try {
 		json update_JSON_obj = json::parse(lotman_JSON_str);
@@ -319,6 +428,10 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 				std::string ext_err = "Error while checking context for parents: ";
 				*err_msg = strdup((ext_err + int_err).c_str());
 			}
+			return -1;
+		}
+
+		if (reject_if_reclaimed(lot.lot_name, "lotman_update_lot", err_msg) != 0) {
 			return -1;
 		}
 
@@ -474,6 +587,10 @@ int lotman_rm_parents_from_lot(const char *lotman_JSON_str, char **err_msg) {
 			return -1;
 		}
 
+		if (reject_if_reclaimed(lot.lot_name, "lotman_rm_parents_from_lot", err_msg) != 0) {
+			return -1;
+		}
+
 		rp = lot.remove_parents(subtraction_JSON_obj["parents"]);
 		if (!rp.first) {
 			if (err_msg) {
@@ -553,6 +670,10 @@ int lotman_rm_paths_from_lots(const char *lotman_JSON_str, char **err_msg) {
 					return -1;
 				}
 
+				if (reject_if_reclaimed(matching_lot_name, "lotman_rm_paths_from_lots", err_msg) != 0) {
+					return -1;
+				}
+
 				removals.push_back({matching_lot_name, path_str});
 			}
 		}
@@ -628,6 +749,10 @@ int lotman_add_to_lot(const char *lotman_JSON_str, char **err_msg) {
 				std::string ext_err = "Error while checking context for parents: ";
 				*err_msg = strdup((ext_err + int_err).c_str());
 			}
+			return -1;
+		}
+
+		if (reject_if_reclaimed(lot.lot_name, "lotman_add_to_lot", err_msg) != 0) {
 			return -1;
 		}
 
@@ -1113,6 +1238,10 @@ int lotman_update_lot_usage(const char *update_JSON_str, bool deltaMode, char **
 			return -1;
 		}
 
+		if (reject_if_reclaimed(lot.lot_name, "lotman_update_lot_usage", err_msg) != 0) {
+			return -1;
+		}
+
 		for (const auto &pair : update_usage_JSON.items()) {
 			if (pair.key() != "lot_name") {
 				rp = lot.update_self_usage(pair.key(), pair.value(), deltaMode);
@@ -1245,7 +1374,7 @@ int lotman_check_db_health(char **err_msg) {
 	return -1;
 }
 
-int lotman_get_lots_past_exp(const bool recursive, char ***output, char **err_msg) {
+int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1257,7 +1386,7 @@ int lotman_get_lots_past_exp(const bool recursive, char ***output, char **err_ms
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_exp(recursive);
+		auto rp = lotman::Lot::get_lots_past_exp(recursive, include_reclaimed);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1292,7 +1421,7 @@ int lotman_get_lots_past_exp(const bool recursive, char ***output, char **err_ms
 	}
 }
 
-int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_msg) {
+int lotman_get_lots_past_del(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1304,7 +1433,7 @@ int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_ms
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_del(recursive);
+		auto rp = lotman::Lot::get_lots_past_del(recursive, include_reclaimed);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1340,8 +1469,8 @@ int lotman_get_lots_past_del(const bool recursive, char ***output, char **err_ms
 	}
 }
 
-int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, char ***output,
-							 const bool hierarchical, char **err_msg) {
+int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
+							 char ***output, const bool hierarchical, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1353,7 +1482,7 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_opp(recursive_quota, recursive_children, hierarchical);
+		auto rp = lotman::Lot::get_lots_past_opp(recursive_quota, recursive_children, include_reclaimed, hierarchical);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1389,8 +1518,8 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 	}
 }
 
-int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, char ***output,
-							 const bool hierarchical, char **err_msg) {
+int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
+							 char ***output, const bool hierarchical, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1402,7 +1531,7 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_ded(recursive_quota, recursive_children, hierarchical);
+		auto rp = lotman::Lot::get_lots_past_ded(recursive_quota, recursive_children, include_reclaimed, hierarchical);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1438,8 +1567,8 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 	}
 }
 
-int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, char ***output,
-							 const bool hierarchical, char **err_msg) {
+int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
+							 char ***output, const bool hierarchical, char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1451,7 +1580,7 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_obj(recursive_quota, recursive_children, hierarchical);
+		auto rp = lotman::Lot::get_lots_past_obj(recursive_quota, recursive_children, include_reclaimed, hierarchical);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1749,6 +1878,26 @@ int lotman_get_lot_as_json(const char *lot_name, const bool recursive, char **ou
 				return -1;
 			}
 			output_obj["parent_attributions"] = rp_attr.first;
+		}
+
+		// Reclamation: emit the ledger row when one exists. Future-dated
+		// reclamations are still surfaced here so callers can see scheduled
+		// reclaim events; runtime filters elsewhere apply `reclaimed_at <= now`.
+		try {
+			auto &storage = lotman::db::StorageManager::get_storage();
+			auto reclaim_row = storage.get_pointer<lotman::db::Reclamation>(lot_name);
+			if (reclaim_row) {
+				json r;
+				r["reclaimed_at"] = reclaim_row->reclaimed_at;
+				r["reason"] = reclaim_row->reclaimed_reason;
+				output_obj["reclamation"] = r;
+			}
+		} catch (const std::exception &e) {
+			if (err_msg) {
+				std::string msg = std::string("Failure on reclamation lookup: ") + e.what();
+				*err_msg = strdup(msg.c_str());
+			}
+			return -1;
 		}
 
 		// Copy the object to output

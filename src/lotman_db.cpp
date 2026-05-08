@@ -904,6 +904,9 @@ std::pair<bool, std::string> Lot::delete_lot_from_db() {
 		// Remove dangling parent references from other lots that had this lot as a parent
 		storage.remove_all<db::Parent>(where(c(&db::Parent::parent) == lot_name));
 
+		// Remove the reclamation ledger entry, if any.
+		storage.remove_all<db::Reclamation>(where(c(&db::Reclamation::lot_name) == lot_name));
+
 		return std::make_pair(true, "");
 	} catch (const std::exception &e) {
 		return std::make_pair(false, std::string("Failed to delete lot: ") + e.what());

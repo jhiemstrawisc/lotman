@@ -130,6 +130,27 @@ struct ParentChildAttribution {
 };
 
 /**
+ * A ledger entry recording that a lot has been (or will be at `reclaimed_at`)
+ * reclaimed by the storage provider. The presence of a row -- combined with
+ * `reclaimed_at <= now` -- indicates that LotMan should treat the lot as a
+ * historical record only. The accounting tie between the lot's paths and
+ * the lot itself is severed: capacity / Axiom-2 sweeps ignore reclaimed
+ * children, dir-based usage updates skip the reclaimed lot's self-write
+ * (parent subtraction math is unchanged), and most mutating APIs reject
+ * writes against a reclaimed lot. Removing the lot also removes its
+ * reclamation row.
+ *
+ * The PK on `lot_name` enforces at most one reclamation row per lot.
+ * `reclaimed_at` is milliseconds since epoch (matching MPA timestamps).
+ * `reclaimed_reason` is opaque free-form text (may be empty).
+ */
+struct Reclamation {
+	std::string lot_name;
+	int64_t reclaimed_at;
+	std::string reclaimed_reason;
+};
+
+/**
  * Creates the sqlite_orm storage definition.
  * This defines the schema mapping between C++ structs and SQLite tables.
  */
@@ -168,7 +189,10 @@ inline auto create_storage(const std::string &db_path) {
 				   make_column("mpa_key", &ParentChildAttribution::mpa_key),
 				   make_column("fraction", &ParentChildAttribution::fraction),
 				   primary_key(&ParentChildAttribution::child_lot_name, &ParentChildAttribution::parent_lot_name,
-							   &ParentChildAttribution::mpa_key)));
+							   &ParentChildAttribution::mpa_key)),
+		make_table("reclamations", make_column("lot_name", &Reclamation::lot_name, primary_key()),
+				   make_column("reclaimed_at", &Reclamation::reclaimed_at),
+				   make_column("reclaimed_reason", &Reclamation::reclaimed_reason)));
 }
 
 // Type alias for the storage type

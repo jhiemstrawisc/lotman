@@ -1937,7 +1937,7 @@ TEST_F(StrictHierarchyTest, HierarchicalDepthOrderedResults) {
 	// All three lots are past their dedicated quota.
 	// Results should be depth-ordered: deepest (leaf) first.
 	char **raw_output = nullptr;
-	rv = lotman_get_lots_past_ded(false, false, &raw_output, true, &raw_err);
+	rv = lotman_get_lots_past_ded(false, false, /*include_reclaimed=*/true, &raw_output, true, &raw_err);
 	err.reset(raw_err);
 	UniqueStringList output(raw_output);
 	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
@@ -2007,7 +2007,7 @@ TEST_F(StrictHierarchyTest, HierarchicalVsNonHierarchical) {
 
 	// Non-hierarchical: just check raw self_GB vs dedicated_GB
 	char **raw_output = nullptr;
-	rv = lotman_get_lots_past_ded(false, false, &raw_output, false, &raw_err);
+	rv = lotman_get_lots_past_ded(false, false, /*include_reclaimed=*/true, &raw_output, false, &raw_err);
 	err.reset(raw_err);
 	UniqueStringList output_nonhier(raw_output);
 	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
@@ -6286,7 +6286,7 @@ TEST_F(StrictHierarchyTest, NonExpiringLotNotReturnedFromPastExpQuery) {
 	// the past relative to "now"; it should be returned. ne_root must NOT.
 	char **raw_lots = nullptr;
 	raw_err = nullptr;
-	int rv = lotman_get_lots_past_exp(/*recursive=*/false, &raw_lots, &raw_err);
+	int rv = lotman_get_lots_past_exp(/*recursive=*/false, /*include_reclaimed=*/true, &raw_lots, &raw_err);
 	UniqueStringList lots(raw_lots);
 	UniqueCString err(raw_err);
 	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
@@ -6304,7 +6304,7 @@ TEST_F(StrictHierarchyTest, NonExpiringLotNotReturnedFromPastExpQuery) {
 	// Same expectation for past-deletion.
 	raw_lots = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_del(/*recursive=*/false, &raw_lots, &raw_err);
+	rv = lotman_get_lots_past_del(/*recursive=*/false, /*include_reclaimed=*/true, &raw_lots, &raw_err);
 	UniqueStringList del_lots(raw_lots);
 	UniqueCString del_err(raw_err);
 	ASSERT_EQ(rv, 0) << (del_err.get() ? del_err.get() : "");
@@ -7047,7 +7047,7 @@ TEST_F(StrictHierarchyTest, UnboundedStorageLotNotReturnedFromPastDedQuery) {
 
 	char **lots = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_ded(false, false, &lots, false, &raw_err);
+	rv = lotman_get_lots_past_ded(false, false, /*include_reclaimed=*/true, &lots, false, &raw_err);
 	UniqueCString perr(raw_err);
 	ASSERT_EQ(rv, 0) << "lotman_get_lots_past_ded failed: " << (perr.get() ? perr.get() : "<no error>");
 	bool found = false;
@@ -7087,7 +7087,7 @@ TEST_F(StrictHierarchyTest, UnboundedObjectsLotNotReturnedFromPastObjQuery) {
 
 	char **lots = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_obj(false, false, &lots, false, &raw_err);
+	rv = lotman_get_lots_past_obj(false, false, /*include_reclaimed=*/true, &lots, false, &raw_err);
 	UniqueCString perr(raw_err);
 	ASSERT_EQ(rv, 0) << "lotman_get_lots_past_obj failed: " << (perr.get() ? perr.get() : "<no error>");
 	bool found = false;

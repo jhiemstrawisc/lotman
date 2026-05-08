@@ -75,6 +75,12 @@ std::vector<SweepEvent> build_attribution_events(const std::string &parent_lot_n
 	std::vector<SweepEvent> events;
 	bool has_window = (start_time < end_time);
 
+	// Compute "now" once for reclamation filtering. A child whose reclamation
+	// row's reclaimed_at <= now is treated as if it no longer holds capacity
+	// (its accounting tie has been severed by the storage provider).
+	auto now_tp = std::chrono::system_clock::now();
+	int64_t now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now_tp).time_since_epoch().count();
+
 	// Get all children of this parent (non-self)
 	auto child_names = storage.select(&db::Parent::lot_name, where(c(&db::Parent::parent) == parent_lot_name and
 																   c(&db::Parent::lot_name) != parent_lot_name));
@@ -83,6 +89,12 @@ std::vector<SweepEvent> build_attribution_events(const std::string &parent_lot_n
 		auto child_mpa = storage.get_pointer<db::ManagementPolicyAttributes>(child_name);
 		if (!child_mpa)
 			continue;
+
+		// Skip reclaimed children: their attributed capacity is treated as freed.
+		auto reclaim_row = storage.get_pointer<db::Reclamation>(child_name);
+		if (reclaim_row && reclaim_row->reclaimed_at <= now_ms) {
+			continue;
+		}
 
 		// Non-expiring children (sentinel: all timestamps are 0) are treated
 		// as if they span (-infinity, +infinity), so they are always present
@@ -333,6 +345,19 @@ std::pair<bool, std::string> lotman::Lot::lot_exists(const std::string &lot_name
 	}
 }
 
+std::pair<bool, std::string> lotman::Lot::is_reclaimed(const std::string &lot_name, int64_t query_time) {
+	try {
+		auto &storage = db::StorageManager::get_storage();
+		auto row = storage.get_pointer<db::Reclamation>(lot_name);
+		if (!row) {
+			return std::make_pair(false, "");
+		}
+		return std::make_pair(row->reclaimed_at <= query_time, "");
+	} catch (const std::exception &e) {
+		return std::make_pair(false, std::string("is_reclaimed failed: ") + e.what());
+	}
+}
+
 std::pair<bool, std::string> lotman::Lot::check_if_root() {
 	try {
 		auto &storage = db::StorageManager::get_storage();
@@ -521,6 +546,62 @@ std::pair<bool, std::string> lotman::Lot::destroy_lot_recursive() {
 	}
 
 	return std::make_pair(true, "");
+}
+
+std::pair<int, std::string> lotman::Lot::reclaim_lot_with_descendants(int64_t reclaimed_at, const std::string &reason) {
+	if (lot_name == "default") {
+		return std::make_pair(-1, "The default lot cannot be reclaimed.");
+	}
+
+	// Collect the subtree.
+	auto rp_lotvec_str = this->get_children(true);
+	if (!rp_lotvec_str.second.empty()) {
+		std::string int_err = rp_lotvec_str.second;
+		std::string ext_err = "Failed to get lot children: ";
+		return std::make_pair(-1, ext_err + int_err);
+	}
+
+	std::vector<std::string> targets;
+	targets.reserve(recursive_children.size() + 1);
+	targets.push_back(lot_name);
+	for (const auto &child : recursive_children) {
+		if (child.lot_name != lot_name) {
+			targets.push_back(child.lot_name);
+		}
+	}
+
+	auto &storage = db::StorageManager::get_storage();
+	std::string txn_error;
+	bool inserted_any = false;
+	bool skipped_existing = false;
+	bool committed = storage.transaction([&] {
+		for (const auto &name : targets) {
+			try {
+				auto existing = storage.get_pointer<db::Reclamation>(name);
+				if (existing) {
+					// Existing reclamation rows are authoritative ledger facts. Do not
+					// overwrite them; skip this lot and continue the cascade.
+					skipped_existing = true;
+					continue;
+				}
+				db::Reclamation row{name, reclaimed_at, reason};
+				storage.replace(row);
+				inserted_any = true;
+			} catch (const std::exception &e) {
+				txn_error = std::string("Failed to reclaim lot '") + name + "': " + e.what();
+				return false;
+			}
+		}
+		return true;
+	});
+
+	if (!committed) {
+		return std::make_pair(-1, txn_error.empty() ? "Transaction failed" : txn_error);
+	}
+	if (!inserted_any && skipped_existing) {
+		return std::make_pair(1, "All target lots already had reclamation rows; no new row was added.");
+	}
+	return std::make_pair(0, "");
 }
 
 std::pair<std::vector<Lot>, std::string> lotman::Lot::get_parents(const bool recursive, const bool get_self) {
@@ -813,7 +894,9 @@ std::pair<std::string, std::string> lotman::Lot::get_lot_from_dir(const std::str
 
 		std::string query = "SELECT p.lot_name FROM paths p "
 							"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
+							"LEFT JOIN reclamations r ON r.lot_name = p.lot_name "
 							"WHERE p.path = ?1 AND mpa.creation_time <= ?2 AND mpa.expiration_time > ?2 "
+							"AND (r.lot_name IS NULL OR r.reclaimed_at > ?2) "
 							"LIMIT 1;";
 		std::map<std::string, std::vector<int>> str_map{{normalized_path, {1}}};
 		std::map<int64_t, std::vector<int>> int_map{{query_time, {2}}};
@@ -2163,6 +2246,20 @@ std::pair<bool, std::string> lotman::Lot::update_usage_by_dirs(const json &updat
 			return std::make_pair(false, err);
 		}
 
+		// If the lot has been reclaimed (reclaimed_at <= query_time), the
+		// accounting tie between its paths and the lot is severed: skip the
+		// self_* writes here. Parent subtraction math (computed in JSON_math)
+		// has already run, so the live parent's accounting is unaffected.
+		auto reclaimed = lotman::Lot::is_reclaimed(lot.lot_name, query_time);
+		if (!reclaimed.second.empty()) {
+			std::string int_err = reclaimed.second;
+			std::string ext_err = "Failed to check if lot is reclaimed: ";
+			return std::make_pair(false, ext_err + int_err);
+		}
+		if (reclaimed.first) {
+			continue;
+		}
+
 		if (lot.usage.self_GB_update_staged) {
 			auto rp_bool_str = lot.update_self_usage("self_GB", lot.usage.self_GB, deltaMode);
 			if (!rp_bool_str.first) {
@@ -2205,6 +2302,37 @@ std::pair<bool, std::string> lotman::Lot::update_usage_by_dirs(const json &updat
 	return std::make_pair(true, "");
 }
 
+// Helper: if include_reclaimed is false, filter out any lot whose reclamation
+// row exists with reclaimed_at <= now. Centralizes the post-filter applied to
+// every get_lots_past_* result so that cleanup loops do not repeatedly process
+// already-reclaimed lots.
+static void filter_reclaimed_in_place(std::vector<std::string> &lots, bool include_reclaimed) {
+	if (include_reclaimed || lots.empty()) {
+		return;
+	}
+	auto now = std::chrono::system_clock::now();
+	int64_t now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
+	auto new_end = std::remove_if(lots.begin(), lots.end(), [&](const std::string &name) {
+		auto rp = lotman::Lot::is_reclaimed(name, now_ms);
+		if (!rp.second.empty()) {
+			// On lookup error, conservatively leave the lot in.
+			return false;
+		}
+		return rp.first;
+	});
+	lots.erase(new_end, lots.end());
+}
+
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(const bool recursive,
+																				const bool include_reclaimed) {
+	auto rp_inner = get_lots_past_exp(recursive);
+	if (!rp_inner.second.empty()) {
+		return rp_inner;
+	}
+	filter_reclaimed_in_place(rp_inner.first, include_reclaimed);
+	return rp_inner;
+}
+
 std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(const bool recursive) {
 	std::vector<std::string> expired_lots;
 	auto now = std::chrono::system_clock::now();
@@ -2232,7 +2360,6 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(
 				return std::make_pair(std::vector<std::string>(), ext_err + int_err);
 			}
 
-			std::vector<std::string> tmp;
 			for (const auto &child : _lot.recursive_children) {
 				tmp.push_back(child.lot_name);
 			}
@@ -2246,6 +2373,16 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(
 	}
 
 	return std::make_pair(expired_lots, "");
+}
+
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_del(const bool recursive,
+																				const bool include_reclaimed) {
+	auto rp_inner = get_lots_past_del(recursive);
+	if (!rp_inner.second.empty()) {
+		return rp_inner;
+	}
+	filter_reclaimed_in_place(rp_inner.first, include_reclaimed);
+	return rp_inner;
 }
 
 std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_del(const bool recursive) {
@@ -2288,6 +2425,17 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_del(
 	}
 
 	return std::make_pair(deletion_lots, "");
+}
+
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_opp(const bool recursive_quota,
+																				const bool recursive_children,
+																				const bool include_reclaimed) {
+	auto rp_inner = get_lots_past_opp(recursive_quota, recursive_children);
+	if (!rp_inner.second.empty()) {
+		return rp_inner;
+	}
+	filter_reclaimed_in_place(rp_inner.first, include_reclaimed);
+	return rp_inner;
 }
 
 std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_opp(const bool recursive_quota,
@@ -2362,6 +2510,17 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_opp(
 }
 
 std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_ded(const bool recursive_quota,
+																				const bool recursive_children,
+																				const bool include_reclaimed) {
+	auto rp_inner = get_lots_past_ded(recursive_quota, recursive_children);
+	if (!rp_inner.second.empty()) {
+		return rp_inner;
+	}
+	filter_reclaimed_in_place(rp_inner.first, include_reclaimed);
+	return rp_inner;
+}
+
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_ded(const bool recursive_quota,
 																				const bool recursive_children) {
 	std::vector<std::string> lots_past_ded;
 	if (recursive_quota) {
@@ -2425,6 +2584,17 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_ded(
 	}
 
 	return std::make_pair(lots_past_ded, "");
+}
+
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_obj(const bool recursive_quota,
+																				const bool recursive_children,
+																				const bool include_reclaimed) {
+	auto rp_inner = get_lots_past_obj(recursive_quota, recursive_children);
+	if (!rp_inner.second.empty()) {
+		return rp_inner;
+	}
+	filter_reclaimed_in_place(rp_inner.first, include_reclaimed);
+	return rp_inner;
 }
 
 std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_obj(const bool recursive_quota,
@@ -2585,27 +2755,47 @@ get_lots_past_threshold_hierarchical(const std::string &self_usage_col, const st
 	//     under an unbounded parent (rejected by axiom 1 otherwise);
 	//     defensively we treat their overflow contribution as 0 so they can
 	//     never push a parent past its own quota.
+	//
+	// Reclamation handling:
+	//   * Reclaimed parents are excluded from the result entirely. A reclaimed
+	//     lot's storage has been released to the default lot, so it can no
+	//     longer be "past" its own quota.
+	//   * Reclaimed children contribute 0 overage to a live parent, since
+	//     their usage no longer accrues to the parent subtree (it has been
+	//     hoovered up by the default lot per the reclamation ledger fact).
+	//   * "Reclaimed" is evaluated as of `now_ms`; future-dated rows do not
+	//     yet apply, mirroring the rest of the reclamation filtering.
+	auto now = std::chrono::system_clock::now();
+	int64_t now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
+
 	std::string query = "SELECT p_usage.lot_name "
 						"FROM lot_usage p_usage "
 						"JOIN management_policy_attributes p_mpa ON p_usage.lot_name = p_mpa.lot_name "
+						"LEFT JOIN reclamations p_rec ON p_rec.lot_name = p_usage.lot_name "
 						"WHERE NOT (" +
 						parent_unbounded_predicate +
 						") "
+						"AND (p_rec.lot_name IS NULL OR p_rec.reclaimed_at > ?1) "
 						"AND p_usage." +
 						self_usage_col +
 						" + COALESCE("
 						"    (SELECT SUM(CASE WHEN (" +
-						child_unbounded_predicate + ") THEN 0 ELSE MAX(0, (" + child_usage_expr + ") - (" +
-						child_threshold_expr +
+						child_unbounded_predicate +
+						") THEN 0 "
+						"                     WHEN (c_rec.lot_name IS NOT NULL AND c_rec.reclaimed_at <= ?1) THEN 0 "
+						"                     ELSE MAX(0, (" +
+						child_usage_expr + ") - (" + child_threshold_expr +
 						")) END) "
 						"     FROM parents c_par "
 						"     JOIN lot_usage c_usage ON c_par.lot_name = c_usage.lot_name "
 						"     JOIN management_policy_attributes c_mpa ON c_par.lot_name = c_mpa.lot_name "
+						"     LEFT JOIN reclamations c_rec ON c_rec.lot_name = c_par.lot_name "
 						"     WHERE c_par.parent = p_usage.lot_name AND c_par.lot_name != c_par.parent), 0"
 						") >= " +
 						parent_threshold_expr + ";";
 
-	auto rp = lotman::db::SQL_get_matches(query);
+	std::map<int64_t, std::vector<int>> int_map{{now_ms, {1}}};
+	auto rp = lotman::db::SQL_get_matches(query, std::map<std::string, std::vector<int>>(), int_map);
 	if (!rp.second.empty()) {
 		return std::make_pair(std::vector<std::string>(), "Failure on " + error_context + ": " + rp.second);
 	}
@@ -2615,35 +2805,56 @@ get_lots_past_threshold_hierarchical(const std::string &self_usage_col, const st
 	return std::make_pair(lots, "");
 }
 
-std::pair<std::vector<std::string>, std::string>
-lotman::Lot::get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool hierarchical) {
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_ded(const bool recursive_quota,
+																				const bool recursive_children,
+																				const bool include_reclaimed,
+																				const bool hierarchical) {
 	if (!hierarchical) {
-		return get_lots_past_ded(recursive_quota, recursive_children);
+		return get_lots_past_ded(recursive_quota, recursive_children, include_reclaimed);
 	}
-	return get_lots_past_threshold_hierarchical("self_GB", "c_usage.self_GB + c_usage.children_GB",
-												"c_mpa.dedicated_GB", "p_mpa.dedicated_GB", "p_mpa.dedicated_GB = -1",
-												"c_mpa.dedicated_GB = -1", "adjusted dedicated query");
+	auto rp_h = get_lots_past_threshold_hierarchical(
+		"self_GB", "c_usage.self_GB + c_usage.children_GB", "c_mpa.dedicated_GB", "p_mpa.dedicated_GB",
+		"p_mpa.dedicated_GB = -1", "c_mpa.dedicated_GB = -1", "adjusted dedicated query");
+	if (!rp_h.second.empty()) {
+		return rp_h;
+	}
+	filter_reclaimed_in_place(rp_h.first, include_reclaimed);
+	return rp_h;
 }
 
-std::pair<std::vector<std::string>, std::string>
-lotman::Lot::get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool hierarchical) {
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_opp(const bool recursive_quota,
+																				const bool recursive_children,
+																				const bool include_reclaimed,
+																				const bool hierarchical) {
 	if (!hierarchical) {
-		return get_lots_past_opp(recursive_quota, recursive_children);
+		return get_lots_past_opp(recursive_quota, recursive_children, include_reclaimed);
 	}
-	return get_lots_past_threshold_hierarchical(
+	auto rp_h = get_lots_past_threshold_hierarchical(
 		"self_GB", "c_usage.self_GB + c_usage.children_GB", "c_mpa.dedicated_GB + c_mpa.opportunistic_GB",
 		"p_mpa.dedicated_GB + p_mpa.opportunistic_GB", "p_mpa.dedicated_GB = -1 OR p_mpa.opportunistic_GB = -1",
 		"c_mpa.dedicated_GB = -1 OR c_mpa.opportunistic_GB = -1", "adjusted opportunistic query");
+	if (!rp_h.second.empty()) {
+		return rp_h;
+	}
+	filter_reclaimed_in_place(rp_h.first, include_reclaimed);
+	return rp_h;
 }
 
-std::pair<std::vector<std::string>, std::string>
-lotman::Lot::get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool hierarchical) {
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_obj(const bool recursive_quota,
+																				const bool recursive_children,
+																				const bool include_reclaimed,
+																				const bool hierarchical) {
 	if (!hierarchical) {
-		return get_lots_past_obj(recursive_quota, recursive_children);
+		return get_lots_past_obj(recursive_quota, recursive_children, include_reclaimed);
 	}
-	return get_lots_past_threshold_hierarchical(
+	auto rp_h = get_lots_past_threshold_hierarchical(
 		"self_objects", "c_usage.self_objects + c_usage.children_objects", "c_mpa.max_num_objects",
 		"p_mpa.max_num_objects", "p_mpa.max_num_objects = -1", "c_mpa.max_num_objects = -1", "adjusted objects query");
+	if (!rp_h.second.empty()) {
+		return rp_h;
+	}
+	filter_reclaimed_in_place(rp_h.first, include_reclaimed);
+	return rp_h;
 }
 
 std::pair<json, std::string> lotman::Lot::get_available_capacity(const std::string &parent_lot_name, int64_t start_time,
@@ -2746,6 +2957,7 @@ lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursiv
 	std::string lots_from_dir_query =
 		"SELECT p.lot_name FROM paths p "
 		"JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
+		"LEFT JOIN reclamations r ON r.lot_name = p.lot_name "
 		"WHERE "
 		"(p.path = ?1 OR ?2 LIKE p.path || '%') " // Exact match or subdirectory of stored path
 		"AND "
@@ -2756,6 +2968,10 @@ lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursiv
 		// timestamp triple as the non-expiring sentinel.
 		"AND ((mpa.creation_time = 0 AND mpa.expiration_time = 0 AND mpa.deletion_time = 0) "
 		"     OR (mpa.creation_time <= ?4 AND mpa.expiration_time > ?4)) "
+		// Reclaimed lots have severed their accounting tie to their paths; treat
+		// them as if the path was not associated with any lot (so the result
+		// falls back to the default lot, matching get_lot_from_dir's behavior).
+		"AND (r.lot_name IS NULL OR r.reclaimed_at > ?4) "
 		"AND NOT EXISTS ( " // Ensure no longer exclusion overrides this inclusion
 		"    SELECT 1 FROM paths e "
 		"    WHERE e.lot_name = p.lot_name "			  // Same lot
@@ -2786,6 +3002,18 @@ lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursiv
 		Lot lot(matching_lots_vec[0]);
 		lot.get_parents(true, false);
 		for (auto &parent : lot.recursive_parents) {
+			// Skip parents that are reclaimed at query_time. The base lot's
+			// own reclamation status is already enforced by the SQL above; we
+			// must apply the same filter to appended ancestors so reclaimed
+			// lots never surface through the recursive parent expansion.
+			auto rec_rp = is_reclaimed(parent.lot_name, query_time);
+			if (!rec_rp.second.empty()) {
+				return std::make_pair(std::vector<std::string>(), "Failure checking reclamation for parent '" +
+																	  parent.lot_name + "': " + rec_rp.second);
+			}
+			if (rec_rp.first) {
+				continue;
+			}
 			matching_lots_vec.push_back(parent.lot_name);
 		}
 	}
