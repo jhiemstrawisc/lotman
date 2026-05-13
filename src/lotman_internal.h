@@ -337,9 +337,9 @@ class Lot {
 															bool include_self = false);
 	std::pair<bool, std::string> check_context_for_children(const std::vector<Lot> &children,
 															bool include_self = false);
-	static std::pair<std::vector<std::string>, std::string> get_lots_past_exp(const bool recursive,
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_exp(int64_t query_time, const bool recursive,
 																			  const bool include_reclaimed);
-	static std::pair<std::vector<std::string>, std::string> get_lots_past_del(const bool recursive,
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_del(int64_t query_time, const bool recursive,
 																			  const bool include_reclaimed);
 	static std::pair<std::vector<std::string>, std::string>
 	get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed);
@@ -350,8 +350,8 @@ class Lot {
 
 	// Internal "no-filter" overloads kept for the include_reclaimed=true path
 	// and reused by the include_reclaimed-aware overloads above.
-	static std::pair<std::vector<std::string>, std::string> get_lots_past_exp(const bool recursive);
-	static std::pair<std::vector<std::string>, std::string> get_lots_past_del(const bool recursive);
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_exp(int64_t query_time, const bool recursive);
+	static std::pair<std::vector<std::string>, std::string> get_lots_past_del(int64_t query_time, const bool recursive);
 	static std::pair<std::vector<std::string>, std::string> get_lots_past_opp(const bool recursive_quota,
 																			  const bool recursive_children);
 	static std::pair<std::vector<std::string>, std::string> get_lots_past_ded(const bool recursive_quota,
@@ -411,6 +411,23 @@ class Lot {
 	static std::pair<std::vector<std::string>, std::string> list_all_lots();
 	static std::pair<std::vector<std::string>, std::string> get_lots_from_dir(const std::string &dir,
 																			  const bool recursive, int64_t query_time);
+
+	// Window-aware variant of get_lots_from_dir. Returns the union of every lot
+	// that "wins" the longest-prefix path-resolution contest at any instant in
+	// the half-open window [time_lo_ms, time_hi_ms). Two lots may both be
+	// returned when each owns the path during disjoint sub-intervals of the
+	// window (e.g. a sublot that takes over from its parent partway through).
+	// When include_reclaimed=false, lots reclaimed at or before time_lo_ms are
+	// dropped entirely; lots reclaimed mid-window have their effective active
+	// interval clipped to [..., reclaimed_at) before the sweep. Sentinel
+	// (all-zero timestamp) lots are treated as always-live and overlap every
+	// window. The default lot is appended iff some instant in the window has
+	// no candidate active. When recursive=true, each winner's ancestors are
+	// also included (matching get_lots_from_dir's recursive semantics), with
+	// ancestors filtered by reclamation under the same rules.
+	static std::pair<std::vector<std::string>, std::string> get_lots_for_path(const std::string &path, bool recursive,
+																			  int64_t time_lo_ms, int64_t time_hi_ms,
+																			  bool include_reclaimed);
 
 	// Advisory: compute available capacity under a parent lot during a time window.
 	// Returns JSON with available and peak values for each resource type.

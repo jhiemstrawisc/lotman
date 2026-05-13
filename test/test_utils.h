@@ -10,6 +10,8 @@
 
 #include "../src/lotman.h"
 
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -79,6 +81,16 @@ inline std::string create_temp_directory(const std::string &prefix = "lotman_tes
 	}
 
 	return temp_dir_template;
+}
+
+/**
+ * Wall-clock "now" expressed in Unix-epoch milliseconds. Returned as a
+ * signed 64-bit integer to match the int64_t timestamp parameters used
+ * throughout the LotMan public API.
+ */
+inline int64_t test_now_ms() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+		.count();
 }
 
 #endif // LOTMAN_TEST_UTILS_H

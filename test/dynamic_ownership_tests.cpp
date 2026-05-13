@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+#include <set>
 
 using json = nlohmann::json;
 
@@ -942,6 +943,328 @@ TEST_F(DynamicOwnershipTest, DeepAncestryChainResolvesCorrectly) {
 						err2);
 	EXPECT_NE(rv2, 0) << "Unrelated lot must still be rejected under deep recursive root. err=" << err2;
 	EXPECT_NE(err2.find("Descendancy violation"), std::string::npos) << "err=" << err2;
+}
+
+// ---------------------------------------------------------------------------
+// lotman_get_lots_for_path: window-aware variant of lotman_get_lots_from_dir.
+// Returns the union of every lot that wins the longest-prefix resolution
+// contest at any instant in [time_lo_ms, time_hi_ms), as a JSON array of full
+// lot objects.
+// ---------------------------------------------------------------------------
+
+class GetLotsForPathTest : public DynamicOwnershipTest {
+  protected:
+	// Invoke lotman_get_lots_for_path and return the parsed JSON array.
+	// Asserts success and that the response parses as a JSON array.
+	json call(const char *path, bool recursive, int64_t time_lo_ms, int64_t time_hi_ms, bool include_reclaimed) {
+		char *raw_out = nullptr;
+		char *raw_err = nullptr;
+		int rv =
+			lotman_get_lots_for_path(path, recursive, time_lo_ms, time_hi_ms, include_reclaimed, &raw_out, &raw_err);
+		UniqueCString out(raw_out);
+		UniqueCString err(raw_err);
+		EXPECT_EQ(rv, 0) << "lotman_get_lots_for_path failed: " << (err.get() ? err.get() : "unknown");
+		if (rv != 0 || !out.get()) {
+			return json::array();
+		}
+		json parsed = json::parse(out.get());
+		EXPECT_TRUE(parsed.is_array()) << "Expected JSON array, got: " << out.get();
+		return parsed;
+	}
+
+	// Invoke lotman_get_lots_for_path and capture the error string. Used for
+	// negative tests where rv != 0 is the expected outcome.
+	int callExpectingError(const char *path, bool recursive, int64_t time_lo_ms, int64_t time_hi_ms,
+						   bool include_reclaimed, std::string &err_out) {
+		char *raw_out = nullptr;
+		char *raw_err = nullptr;
+		int rv =
+			lotman_get_lots_for_path(path, recursive, time_lo_ms, time_hi_ms, include_reclaimed, &raw_out, &raw_err);
+		UniqueCString out(raw_out);
+		if (raw_err) {
+			err_out.assign(raw_err);
+			free(raw_err);
+		} else {
+			err_out.clear();
+		}
+		return rv;
+	}
+
+	// Project the array to a sorted set of lot_name fields for easy assertions.
+	std::set<std::string> names(const json &arr) {
+		std::set<std::string> out;
+		for (const auto &obj : arr) {
+			if (obj.contains("lot_name") && obj["lot_name"].is_string()) {
+				out.insert(obj["lot_name"].get<std::string>());
+			}
+		}
+		return out;
+	}
+
+	// Reclaim a lot at a given timestamp via the public C API.
+	void reclaimLot(const char *name, int64_t when_ms, const char *reason) {
+		char *raw_err = nullptr;
+		int rv = lotman_reclaim_lot(name, when_ms, reason, &raw_err);
+		UniqueCString err(raw_err);
+		ASSERT_EQ(rv, 0) << "set_reclaimed failed: " << (err.get() ? err.get() : "unknown");
+	}
+};
+
+// Single match: a recursively-owned subtree returns exactly its owning lot
+// for any path inside the subtree, and each element is a full lot object.
+TEST_F(GetLotsForPathTest, SingleMatchReturnsFullLotObject) {
+	addLotFooRecursive("lot1");
+
+	json arr = call("/foo/bar", /*recursive=*/false, /*time_lo=*/500, /*time_hi=*/501,
+					/*include_reclaimed=*/true);
+	ASSERT_EQ(arr.size(), 1u);
+	const auto &obj = arr[0];
+	EXPECT_EQ(obj["lot_name"], "lot1");
+	// Shape: full lot object (matches lotman_get_lot_as_json with recursive=false).
+	EXPECT_TRUE(obj.contains("owner"));
+	EXPECT_TRUE(obj.contains("parents"));
+	EXPECT_TRUE(obj.contains("children"));
+	EXPECT_TRUE(obj.contains("paths"));
+	EXPECT_TRUE(obj.contains("management_policy_attrs"));
+	EXPECT_TRUE(obj.contains("usage"));
+	EXPECT_TRUE(obj.contains("parent_attributions"));
+	// recursive=false: no "owners" or "restrictive_management_policy_attrs".
+	EXPECT_FALSE(obj.contains("owners"));
+	EXPECT_FALSE(obj.contains("restrictive_management_policy_attrs"));
+}
+
+// Two lots covering the path during disjoint sub-windows are both returned
+// when the query window straddles the takeover.
+TEST_F(GetLotsForPathTest, DisjointSubWindowsReturnsBoth) {
+	addLotFooRecursive("lot1"); // active [100, 9000)
+
+	// lot2 takes over /foo/bar starting at t=5000.
+	addLot(R"({
+		"lot_name": "lot2",
+		"owner": "owner1",
+		"parents": ["lot1"],
+		"paths": [{"path": "/foo/bar", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 5000,
+			"expiration_time": 8000,
+			"deletion_time": 8500
+		}
+	})");
+
+	// Window straddles the takeover; lot1 wins [1000, 5000), lot2 wins [5000, 7000).
+	auto got = names(call("/foo/bar", false, 1000, 7000, true));
+	EXPECT_EQ(got, (std::set<std::string>{"lot1", "lot2"}));
+
+	// Window entirely before takeover: only lot1.
+	EXPECT_EQ(names(call("/foo/bar", false, 1000, 4000, true)), (std::set<std::string>{"lot1"}));
+
+	// Window entirely after takeover: only lot2.
+	EXPECT_EQ(names(call("/foo/bar", false, 5500, 7000, true)), (std::set<std::string>{"lot2"}));
+}
+
+// Full sublot shadowing: a sublot whose active interval fully covers the
+// query window suppresses its longer-prefix-losing parent for this path.
+TEST_F(GetLotsForPathTest, FullSublotShadowsParent) {
+	addLotFooRecursive("lot1"); // recursive on /foo, active [100, 9000)
+	addLot(R"({
+		"lot_name": "lot2",
+		"owner": "owner1",
+		"parents": ["lot1"],
+		"paths": [{"path": "/foo/bar", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 8500
+		}
+	})");
+
+	// /foo/bar is fully covered by lot2's longer claim throughout the window.
+	EXPECT_EQ(names(call("/foo/bar", false, 1000, 7000, true)), (std::set<std::string>{"lot2"}));
+}
+
+// An excluded path on the longer-prefix-winning lot does NOT shadow the
+// shorter-prefix candidate.
+TEST_F(GetLotsForPathTest, ExcludedSublotDoesNotShadow) {
+	addLotFooRecursive("lot1");
+	addLot(R"({
+		"lot_name": "lot2",
+		"owner": "owner1",
+		"parents": ["lot1"],
+		"paths": [{"path": "/foo/bar", "recursive": true, "exclude": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 8500
+		}
+	})");
+
+	// Excluded lot2 row does not own /foo/bar; lot1 still wins.
+	EXPECT_EQ(names(call("/foo/bar", false, 1000, 7000, true)), (std::set<std::string>{"lot1"}));
+}
+
+// recursive=true appends the ancestor chain of every winner.
+TEST_F(GetLotsForPathTest, RecursiveAppendsAncestors) {
+	addLotFooRecursive("lot1");
+	addLot(R"({
+		"lot_name": "lot2",
+		"owner": "owner1",
+		"parents": ["lot1"],
+		"paths": [{"path": "/foo/bar", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 8500
+		}
+	})");
+
+	auto got = names(call("/foo/bar", /*recursive=*/true, 1000, 7000, true));
+	// Ancestors of lot2: lot1 -> default (and lot2 itself wins directly).
+	EXPECT_TRUE(got.count("lot2"));
+	EXPECT_TRUE(got.count("lot1"));
+	EXPECT_TRUE(got.count("default"));
+}
+
+// Default-lot fallback: no lot covers the path anywhere in the window.
+TEST_F(GetLotsForPathTest, DefaultLotFallback) {
+	// No /foo lot; only the default lot from SetUp scaffolds /default.
+	auto got = names(call("/no/such/path", false, 100, 200, true));
+	EXPECT_EQ(got, (std::set<std::string>{"default"}));
+}
+
+// A lot whose MPA window is entirely outside the query window does not appear,
+// and the default lot is appended for the gap.
+TEST_F(GetLotsForPathTest, OutOfWindowFallsBackToDefault) {
+	addLotFooRecursive("lot1"); // [100, 9000)
+	auto got = names(call("/foo/bar", false, 20000, 30000, true));
+	EXPECT_EQ(got, (std::set<std::string>{"default"}));
+}
+
+// Sentinel (all-zero MPA timestamps) lots are always-live and overlap any
+// window, including far-future windows.
+TEST_F(GetLotsForPathTest, SentinelAlwaysReturned) {
+	addLot(R"({
+		"lot_name": "always_live",
+		"owner": "owner1",
+		"parents": ["default"],
+		"paths": [{"path": "/foo", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 0,
+			"expiration_time": 0,
+			"deletion_time": 0
+		}
+	})");
+	// Far-future window: sentinel still wins.
+	EXPECT_EQ(names(call("/foo/bar", false, 1'000'000'000'000LL, 2'000'000'000'000LL, true)),
+			  (std::set<std::string>{"always_live"}));
+}
+
+// Reclamation timestamp before the query window drops the lot entirely
+// when include_reclaimed=false; passing include_reclaimed=true brings it back.
+TEST_F(GetLotsForPathTest, ReclaimedBeforeWindowDroppedUnlessIncluded) {
+	addLotFooRecursive("lot1"); // [100, 9000)
+	reclaimLot("lot1", 500, "test");
+
+	// include_reclaimed=false, window entirely after reclamation: lot1 dropped,
+	// fall back to default.
+	EXPECT_EQ(names(call("/foo/bar", false, 1000, 2000, /*include_reclaimed=*/false)),
+			  (std::set<std::string>{"default"}));
+
+	// include_reclaimed=true: reclamation is ignored; lot1 wins.
+	EXPECT_EQ(names(call("/foo/bar", false, 1000, 2000, /*include_reclaimed=*/true)), (std::set<std::string>{"lot1"}));
+}
+
+// Reclamation in the middle of the window clips the active interval; the lot
+// still wins for the pre-reclaim slice and the default lot covers the tail.
+TEST_F(GetLotsForPathTest, ReclaimedMidWindowClipped) {
+	addLotFooRecursive("lot1");		 // [100, 9000)
+	reclaimLot("lot1", 1500, "mid"); // mid-window
+
+	// Window [1000, 2000): lot1 wins [1000, 1500), default covers [1500, 2000).
+	auto got = names(call("/foo/bar", false, 1000, 2000, /*include_reclaimed=*/false));
+	EXPECT_EQ(got, (std::set<std::string>{"lot1", "default"}));
+}
+
+// Invalid window: time_hi <= time_lo is rejected with a descriptive error.
+TEST_F(GetLotsForPathTest, InvalidWindowRejected) {
+	std::string err;
+	int rv = callExpectingError("/foo", false, 1000, 1000, true, err);
+	EXPECT_NE(rv, 0);
+	EXPECT_FALSE(err.empty());
+
+	rv = callExpectingError("/foo", false, 1000, 500, true, err);
+	EXPECT_NE(rv, 0);
+	EXPECT_FALSE(err.empty());
+}
+
+// Null path argument is rejected with an error.
+TEST_F(GetLotsForPathTest, NullPathRejected) {
+	std::string err;
+	int rv = callExpectingError(nullptr, false, 1000, 2000, true, err);
+	EXPECT_NE(rv, 0);
+	EXPECT_FALSE(err.empty());
+}
+
+// Path outside any lot's coverage returns just the default lot.
+TEST_F(GetLotsForPathTest, NonExistentPathReturnsDefault) {
+	addLotFooRecursive("lot1");
+	auto got = names(call("/totally/unrelated", false, 200, 300, true));
+	EXPECT_EQ(got, (std::set<std::string>{"default"}));
+}
+
+// Reclamation cascades to descendants (lotman_reclaim_lot semantics):
+// reclaiming an ancestor reclaims every descendant in the same cascade. As a
+// result, lotman_get_lots_for_path with include_reclaimed=false on a path
+// owned by a sublot of a reclaimed ancestor returns only the default lot for
+// any window after the reclamation timestamp, even when the sublot's MPA
+// would otherwise place it inside the window.
+TEST_F(GetLotsForPathTest, AncestorReclamationCascadesIntoSublot) {
+	addLotFooRecursive("lot1"); // ancestor on /foo, active [100, 9000)
+	addLot(R"({
+		"lot_name": "lot2",
+		"owner": "owner1",
+		"parents": ["lot1"],
+		"paths": [{"path": "/foo/bar", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 200,
+			"expiration_time": 8000,
+			"deletion_time": 8500
+		}
+	})");
+
+	// Reclaim the ancestor; cascade applies the same reclaimed_at to lot2.
+	reclaimLot("lot1", 500, "ancestor-cascade");
+
+	// Window strictly after the cascade reclamation: both lot1 and lot2 are
+	// reclaimed for the entire window, so neither survives the SQL pre-filter.
+	// Only the default lot remains.
+	auto got_filtered = names(call("/foo/bar", /*recursive=*/true, 1000, 7000, /*include_reclaimed=*/false));
+	EXPECT_EQ(got_filtered, (std::set<std::string>{"default"}))
+		<< "Cascaded reclamation must drop both ancestor and descendant from the result";
+
+	// include_reclaimed=true brings both back, with lot2 winning /foo/bar
+	// directly and lot1 + default appearing as recursive ancestors.
+	auto got_unfiltered = names(call("/foo/bar", /*recursive=*/true, 1000, 7000, /*include_reclaimed=*/true));
+	EXPECT_TRUE(got_unfiltered.count("lot2"));
+	EXPECT_TRUE(got_unfiltered.count("lot1"));
+	EXPECT_TRUE(got_unfiltered.count("default"));
 }
 
 } // namespace

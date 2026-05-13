@@ -35,6 +35,7 @@
 #include <cstring>
 #include <filesystem>
 #include <gtest/gtest.h>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <string>
@@ -546,7 +547,7 @@ TEST_F(ReclamationTest, PastExpQueryRespectsIncludeReclaimed) {
 	// Sanity: appears in past_exp before reclaim.
 	char *raw_err = nullptr;
 	char **raw_lots = nullptr;
-	ASSERT_EQ(lotman_get_lots_past_exp(false, /*include_reclaimed=*/true, &raw_lots, &raw_err), 0);
+	ASSERT_EQ(lotman_get_lots_past_exp(test_now_ms(), false, /*include_reclaimed=*/true, &raw_lots, &raw_err), 0);
 	UniqueCString cleanup_err(raw_err);
 	UniqueStringList lots(raw_lots);
 	std::set<std::string> before;
@@ -561,7 +562,7 @@ TEST_F(ReclamationTest, PastExpQueryRespectsIncludeReclaimed) {
 	// include_reclaimed=true -> still present.
 	raw_err = nullptr;
 	char **raw_lots_inc = nullptr;
-	ASSERT_EQ(lotman_get_lots_past_exp(false, true, &raw_lots_inc, &raw_err), 0);
+	ASSERT_EQ(lotman_get_lots_past_exp(test_now_ms(), false, true, &raw_lots_inc, &raw_err), 0);
 	UniqueCString eg1(raw_err);
 	UniqueStringList lots_inc(raw_lots_inc);
 	std::set<std::string> with_inc;
@@ -572,7 +573,7 @@ TEST_F(ReclamationTest, PastExpQueryRespectsIncludeReclaimed) {
 	// include_reclaimed=false -> filtered out.
 	raw_err = nullptr;
 	char **raw_lots_exc = nullptr;
-	ASSERT_EQ(lotman_get_lots_past_exp(false, false, &raw_lots_exc, &raw_err), 0);
+	ASSERT_EQ(lotman_get_lots_past_exp(test_now_ms(), false, false, &raw_lots_exc, &raw_err), 0);
 	UniqueCString eg2(raw_err);
 	UniqueStringList lots_exc(raw_lots_exc);
 	std::set<std::string> without;
@@ -596,7 +597,7 @@ TEST_F(ReclamationTest, PastDelQueryRespectsIncludeReclaimed) {
 
 	char *raw_err = nullptr;
 	char **raw_lots = nullptr;
-	ASSERT_EQ(lotman_get_lots_past_del(false, true, &raw_lots, &raw_err), 0);
+	ASSERT_EQ(lotman_get_lots_past_del(test_now_ms(), false, true, &raw_lots, &raw_err), 0);
 	UniqueCString cleanup_err(raw_err);
 	UniqueStringList lots(raw_lots);
 	std::set<std::string> before;
@@ -609,7 +610,7 @@ TEST_F(ReclamationTest, PastDelQueryRespectsIncludeReclaimed) {
 
 	raw_err = nullptr;
 	char **raw_lots_exc = nullptr;
-	ASSERT_EQ(lotman_get_lots_past_del(false, false, &raw_lots_exc, &raw_err), 0);
+	ASSERT_EQ(lotman_get_lots_past_del(test_now_ms(), false, false, &raw_lots_exc, &raw_err), 0);
 	UniqueCString eg(raw_err);
 	UniqueStringList lots_exc(raw_lots_exc);
 	std::set<std::string> after;
@@ -720,7 +721,7 @@ TEST_F(ReclamationTest, PastQueriesIncludeFutureScheduledReclamation) {
 
 	char *raw_err = nullptr;
 	char **raw_lots = nullptr;
-	ASSERT_EQ(lotman_get_lots_past_exp(false, /*include_reclaimed=*/false, &raw_lots, &raw_err), 0);
+	ASSERT_EQ(lotman_get_lots_past_exp(test_now_ms(), false, /*include_reclaimed=*/false, &raw_lots, &raw_err), 0);
 	UniqueCString cleanup_err(raw_err);
 	UniqueStringList lots(raw_lots);
 	std::set<std::string> got;
@@ -990,7 +991,9 @@ TEST_F(ReclamationTest, GetLotsPastExpRecursiveIncludesDescendants) {
 
 	char *raw_err = nullptr;
 	char **raw_lots = nullptr;
-	ASSERT_EQ(lotman_get_lots_past_exp(/*recursive=*/true, /*include_reclaimed=*/true, &raw_lots, &raw_err), 0);
+	ASSERT_EQ(
+		lotman_get_lots_past_exp(test_now_ms(), /*recursive=*/true, /*include_reclaimed=*/true, &raw_lots, &raw_err),
+		0);
 	UniqueCString cleanup_err(raw_err);
 	UniqueStringList lots(raw_lots);
 	std::set<std::string> got;
@@ -998,6 +1001,214 @@ TEST_F(ReclamationTest, GetLotsPastExpRecursiveIncludesDescendants) {
 		got.insert(lots.get()[i]);
 	EXPECT_TRUE(got.count("exp_root"));
 	EXPECT_TRUE(got.count("exp_child")) << "Recursive past_exp must include children of expired ancestors";
+}
+
+// query_time parameter on past_exp/past_del: a cutoff strictly in the past
+// (before any expiration_time) must yield an empty list, while a cutoff far
+// in the future must include the expired/deleted lot. The cutoff overrides
+// "now"; this is the parameterization that lets callers reason about future
+// or past states of the ledger.
+TEST_F(ReclamationTest, GetLotsPastExpRespectsQueryTimeCutoff) {
+	addDefaultLot();
+	// expiration_time = 5000 in the past (since PAST_TS = 1 and tests run with
+	// real wall-clock); we control inclusion via the query_time argument.
+	addLot(R"({
+		"lot_name": "soon_expired",
+		"owner": "owner1",
+		"parents": ["default"],
+		"paths": [{"path": "/soon", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 5000,
+			"deletion_time": 6000
+		}
+	})");
+
+	// Cutoff = 4000 (before expiration_time): should NOT be returned.
+	{
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_exp(/*query_time=*/4000, /*recursive=*/false,
+										   /*include_reclaimed=*/true, &raw_lots, &raw_err),
+				  0)
+			<< (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		std::set<std::string> got;
+		for (int i = 0; lots.get()[i]; ++i)
+			got.insert(lots.get()[i]);
+		EXPECT_EQ(got.count("soon_expired"), 0u);
+	}
+
+	// Cutoff = 6000 (after expiration_time, before deletion_time): should be
+	// returned by past_exp but NOT by past_del.
+	{
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_exp(/*query_time=*/6000, /*recursive=*/false,
+										   /*include_reclaimed=*/true, &raw_lots, &raw_err),
+				  0)
+			<< (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		std::set<std::string> got;
+		for (int i = 0; lots.get()[i]; ++i)
+			got.insert(lots.get()[i]);
+		EXPECT_EQ(got.count("soon_expired"), 1u);
+	}
+
+	// Cutoff = 5500 (between expiration and deletion): past_del should NOT
+	// return it.
+	{
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_del(/*query_time=*/5500, /*recursive=*/false,
+										   /*include_reclaimed=*/true, &raw_lots, &raw_err),
+				  0)
+			<< (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		std::set<std::string> got;
+		for (int i = 0; lots.get()[i]; ++i)
+			got.insert(lots.get()[i]);
+		EXPECT_EQ(got.count("soon_expired"), 0u);
+	}
+
+	// Cutoff = 7000 (after deletion_time): past_del should return it.
+	{
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_del(/*query_time=*/7000, /*recursive=*/false,
+										   /*include_reclaimed=*/true, &raw_lots, &raw_err),
+				  0)
+			<< (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		std::set<std::string> got;
+		for (int i = 0; lots.get()[i]; ++i)
+			got.insert(lots.get()[i]);
+		EXPECT_EQ(got.count("soon_expired"), 1u);
+	}
+}
+
+// Sentinel (creation == expiration == deletion == 0) lots are non-expiring
+// and must never be returned by past_exp / past_del regardless of the cutoff.
+TEST_F(ReclamationTest, SentinelLotNeverReturnedByPastQueriesAtAnyCutoff) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "sentinel",
+		"owner": "owner1",
+		"parents": ["sentinel"],
+		"paths": [{"path": "/sentinel", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 0,
+			"expiration_time": 0,
+			"deletion_time": 0
+		}
+	})");
+
+	for (int64_t cutoff : {static_cast<int64_t>(1), static_cast<int64_t>(1'000'000'000'000LL),
+						   std::numeric_limits<int64_t>::max() / 2}) {
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_exp(cutoff, false, true, &raw_lots, &raw_err), 0) << (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		for (int i = 0; lots.get()[i]; ++i) {
+			EXPECT_STRNE(lots.get()[i], "sentinel") << "sentinel must never appear in past_exp at cutoff=" << cutoff;
+		}
+
+		raw_err = nullptr;
+		raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_del(cutoff, false, true, &raw_lots, &raw_err), 0) << (raw_err ? raw_err : "");
+		UniqueCString err2(raw_err);
+		UniqueStringList lots2(raw_lots);
+		for (int i = 0; lots2.get()[i]; ++i) {
+			EXPECT_STRNE(lots2.get()[i], "sentinel") << "sentinel must never appear in past_del at cutoff=" << cutoff;
+		}
+	}
+}
+
+// Reclamation evaluation uses the supplied query_time, not wall-clock now:
+// a future-scheduled reclamation only takes effect for cutoffs after the
+// scheduled reclaimed_at.
+TEST_F(ReclamationTest, PastQueriesEvaluateReclamationAtSuppliedQueryTime) {
+	addDefaultLot();
+	addLot(R"({
+		"lot_name": "scheduled",
+		"owner": "owner1",
+		"parents": ["default"],
+		"paths": [{"path": "/sched", "recursive": true}],
+		"management_policy_attrs": {
+			"dedicated_GB": 10,
+			"opportunistic_GB": 5,
+			"max_num_objects": 100,
+			"creation_time": 100,
+			"expiration_time": 5000,
+			"deletion_time": 6000
+		}
+	})");
+
+	// Schedule reclamation for t=8000 (in the future relative to the
+	// expiration/deletion timestamps used here).
+	{
+		char *raw_err = nullptr;
+		ASSERT_EQ(lotman_reclaim_lot("scheduled", 8000, "test-scheduled", &raw_err), 0) << (raw_err ? raw_err : "");
+		free(raw_err);
+	}
+
+	// Cutoff = 7000 (post-expiration, pre-reclamation): include_reclaimed=false
+	// should still return the lot because reclaimed_at > query_time.
+	{
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_exp(7000, false, /*include_reclaimed=*/false, &raw_lots, &raw_err), 0)
+			<< (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		std::set<std::string> got;
+		for (int i = 0; lots.get()[i]; ++i)
+			got.insert(lots.get()[i]);
+		EXPECT_EQ(got.count("scheduled"), 1u)
+			<< "Reclaimed-in-future-relative-to-query_time lot must still appear under include_reclaimed=false";
+	}
+
+	// Cutoff = 9000 (post-reclamation): include_reclaimed=false should NOT
+	// return the lot because reclaimed_at <= query_time.
+	{
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_exp(9000, false, /*include_reclaimed=*/false, &raw_lots, &raw_err), 0)
+			<< (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		std::set<std::string> got;
+		for (int i = 0; lots.get()[i]; ++i)
+			got.insert(lots.get()[i]);
+		EXPECT_EQ(got.count("scheduled"), 0u)
+			<< "Reclaimed-before-query_time lot must be filtered out under include_reclaimed=false";
+	}
+
+	// Same cutoff with include_reclaimed=true should still return the lot.
+	{
+		char *raw_err = nullptr;
+		char **raw_lots = nullptr;
+		ASSERT_EQ(lotman_get_lots_past_exp(9000, false, /*include_reclaimed=*/true, &raw_lots, &raw_err), 0)
+			<< (raw_err ? raw_err : "");
+		UniqueCString err(raw_err);
+		UniqueStringList lots(raw_lots);
+		std::set<std::string> got;
+		for (int i = 0; lots.get()[i]; ++i)
+			got.insert(lots.get()[i]);
+		EXPECT_EQ(got.count("scheduled"), 1u)
+			<< "include_reclaimed=true must surface the lot regardless of reclamation status";
+	}
 }
 
 } // namespace

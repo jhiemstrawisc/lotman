@@ -761,16 +761,25 @@ int lotman_reclaim_lot(const char *lot_name, int64_t reclaimed_at, const char *r
 		A reference to a char array that can store any error messages.
 */
 
-int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg);
+int lotman_get_lots_past_exp(int64_t query_time, const bool recursive, const bool include_reclaimed, char ***output,
+							 char **err_msg);
 /**
-	DESCRIPTION: A function for determining all lots in the database that are past their expiration.
-		The function can determine which lots meet this criteria either by looking at the expiration
-		directly associated with each lot, or recursively by looking at the most restricting
-		expiration in each lot's parent tree.
+	DESCRIPTION: A function for determining all lots in the database that are past their expiration
+		relative to a caller-supplied cutoff. The function can determine which lots meet this criteria
+		either by looking at the expiration directly associated with each lot, or recursively by
+		looking at the most restricting expiration in each lot's parent tree.
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
 	INPUTS:
+	query_time:
+		A Unix timestamp in milliseconds used as the expiration cutoff. A lot is included iff its
+		`expiration_time` is non-zero AND `expiration_time <= query_time`. The same value is used
+		for reclamation evaluation when include_reclaimed=false: a lot is treated as reclaimed iff
+		its reclamation row's `reclaimed_at <= query_time`. Pass wall-clock now() for the
+		historical "as of now" semantics; pass a future timestamp to preview which lots will be
+		expired by then.
+
 	recursive:
 		A boolean indicating whether the output should contain only lots whose personal expiration is
 		passed (recursive = false) or it should contain all lots who may also have an expired parent
@@ -778,7 +787,7 @@ int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed,
 
 	include_reclaimed:
 		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
-		`reclaimed_at <= now`) should be included in the result. When false (the typical use
+		`reclaimed_at <= query_time`) should be included in the result. When false (the typical use
 		case for cleanup loops), reclaimed lots are filtered out so the loop will not repeatedly
 		process lots that the storage provider has already cleaned up.
 
@@ -788,18 +797,29 @@ int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed,
 
 	err_msg:
 		A reference to a char array that can store any error messages.
+
+	NOTE: Sentinel (non-expiring, all-zero timestamp) lots are never returned regardless of
+		query_time, matching the rest of LotMan's sentinel handling.
 */
 
-int lotman_get_lots_past_del(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg);
+int lotman_get_lots_past_del(int64_t query_time, const bool recursive, const bool include_reclaimed, char ***output,
+							 char **err_msg);
 /**
-	DESCRIPTION: A function for determining all lots in the database that are past their deletion time.
-		The function can determine which lots meet this criteria either by looking at the deletion time
-		directly associated with each lot, or recursively by looking at the most restricting deletion
-		time in each lot's parent tree.
+	DESCRIPTION: A function for determining all lots in the database that are past their deletion time
+		relative to a caller-supplied cutoff. The function can determine which lots meet this criteria
+		either by looking at the deletion time directly associated with each lot, or recursively by
+		looking at the most restricting deletion time in each lot's parent tree.
 
 	RETURNS: Returns 0 on success. Any other values indicate an error.
 
 	INPUTS:
+	query_time:
+		A Unix timestamp in milliseconds used as the deletion cutoff. A lot is included iff its
+		`deletion_time` is non-zero AND `deletion_time <= query_time`. The same value is used for
+		reclamation evaluation when include_reclaimed=false. Pass wall-clock now() for the
+		historical "as of now" semantics; pass a future timestamp to preview which lots will be
+		past their deletion time by then.
+
 	recursive:
 		A boolean indicating whether the output should contain only lots whose personal deletion time is
 		passed (recursive = false) or it should contain all lots who may also have a parent passed its
@@ -807,7 +827,7 @@ int lotman_get_lots_past_del(const bool recursive, const bool include_reclaimed,
 
 	include_reclaimed:
 		A boolean indicating whether reclaimed lots (rows in the `reclamations` ledger whose
-		`reclaimed_at <= now`) should be included in the result. Cleanup loops should typically
+		`reclaimed_at <= query_time`) should be included in the result. Cleanup loops should typically
 		pass false so they do not repeatedly process lots that have already been reclaimed.
 
 	output:
@@ -816,6 +836,9 @@ int lotman_get_lots_past_del(const bool recursive, const bool include_reclaimed,
 
 	err_msg:
 		A reference to a char array that can store any error messages.
+
+	NOTE: Sentinel (non-expiring, all-zero timestamp) lots are never returned regardless of
+		query_time.
 */
 
 int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
@@ -1111,6 +1134,63 @@ int lotman_get_lots_from_dir(const char *dir, const bool recursive, int64_t quer
 	output:
 		A reference to a char ** for storing the output array.
 		NOTE: Requires the use of lotman_free_string_list to free the memory allocated for this array.
+
+	err_msg:
+		A reference to a char array that can store any error messages.
+*/
+
+int lotman_get_lots_for_path(const char *path, bool recursive, int64_t time_lo_ms, int64_t time_hi_ms,
+							 bool include_reclaimed, char **output, char **err_msg);
+/**
+	DESCRIPTION: Window-aware variant of lotman_get_lots_from_dir. Returns the union of every lot
+		that "wins" the longest-prefix path-resolution contest at any instant in the half-open
+		window [time_lo_ms, time_hi_ms). Two lots may both be returned when each owns the path
+		during disjoint sub-intervals of the window (for example a sublot that takes over from
+		its parent partway through the window). The dynamic-ownership rules from
+		lotman_get_lots_from_dir apply unchanged: same lot, longer included path wins; an
+		excluded path row strictly longer than a candidate inclusion suppresses it; the default
+		lot is appended iff some instant in the window has no candidate active.
+
+	RETURNS: Returns 0 on success. Any other values indicate an error.
+
+	INPUTS:
+	path:
+		A string indicating the path to be queried for. Trailing slashes are normalized internally;
+		matching is performed against the lots' stored path rows.
+
+	recursive:
+		A boolean indicating whether only the directly-resolved owning lot(s) should be returned
+		(recursive = false), or whether all parent lots of each winner should also be returned
+		(recursive = true). Matches the meaning of the recursive argument on lotman_get_lots_from_dir.
+
+	time_lo_ms:
+		Beginning of the query window, as a Unix timestamp in milliseconds (inclusive).
+
+	time_hi_ms:
+		End of the query window, as a Unix timestamp in milliseconds (exclusive). A lot's
+		[creation_time, expiration_time) interval is considered to overlap the window iff
+		creation_time < time_hi_ms AND expiration_time > time_lo_ms. Sentinel (all-zero
+		timestamp) lots are treated as always-live and overlap every window. Must be strictly
+		greater than time_lo_ms; otherwise the function fails with err_msg set.
+
+	include_reclaimed:
+		A boolean indicating how reclamation rows interact with the window. When true, reclaimed
+		lots are included as if no reclamation row existed. When false, lots whose reclamation
+		row has reclaimed_at <= time_lo_ms are dropped entirely (their storage has been released
+		for the entirety of the window), while lots reclaimed mid-window have their effective
+		active interval clipped to [..., reclaimed_at) before the longest-prefix sweep — they
+		may still be returned iff their pre-reclamation interval makes them a winner. When
+		recursive=true, ancestors are filtered under the same rule: an ancestor is suppressed
+		only when it is reclaimed for the entirety of the window (reclaimed_at <= time_lo_ms).
+
+	output:
+		A reference to a char * for storing the result, formatted as a JSON array string. Each
+		element of the array is a full lot object identical in shape to a single
+		lotman_get_lot_as_json(lot_name, recursive=false) result; see that API's output JSON
+		specification for the field set. The result always contains at least one element: when
+		no lot wins anywhere in the window, the default lot is appended (matching
+		lotman_get_lots_from_dir's fallback behavior).
+		NOTE: The caller owns the returned string and must free() it.
 
 	err_msg:
 		A reference to a char array that can store any error messages.

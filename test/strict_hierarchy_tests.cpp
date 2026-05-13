@@ -6290,7 +6290,8 @@ TEST_F(StrictHierarchyTest, NonExpiringLotNotReturnedFromPastExpQuery) {
 	// the past relative to "now"; it should be returned. ne_root must NOT.
 	char **raw_lots = nullptr;
 	raw_err = nullptr;
-	int rv = lotman_get_lots_past_exp(/*recursive=*/false, /*include_reclaimed=*/true, &raw_lots, &raw_err);
+	int rv =
+		lotman_get_lots_past_exp(test_now_ms(), /*recursive=*/false, /*include_reclaimed=*/true, &raw_lots, &raw_err);
 	UniqueStringList lots(raw_lots);
 	UniqueCString err(raw_err);
 	ASSERT_EQ(rv, 0) << (err.get() ? err.get() : "");
@@ -6308,7 +6309,7 @@ TEST_F(StrictHierarchyTest, NonExpiringLotNotReturnedFromPastExpQuery) {
 	// Same expectation for past-deletion.
 	raw_lots = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_del(/*recursive=*/false, /*include_reclaimed=*/true, &raw_lots, &raw_err);
+	rv = lotman_get_lots_past_del(test_now_ms(), /*recursive=*/false, /*include_reclaimed=*/true, &raw_lots, &raw_err);
 	UniqueStringList del_lots(raw_lots);
 	UniqueCString del_err(raw_err);
 	ASSERT_EQ(rv, 0) << (del_err.get() ? del_err.get() : "");

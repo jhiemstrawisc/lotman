@@ -1388,7 +1388,8 @@ int lotman_check_db_health(char **err_msg) {
 	return -1;
 }
 
-int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg) {
+int lotman_get_lots_past_exp(int64_t query_time, const bool recursive, const bool include_reclaimed, char ***output,
+							 char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1400,7 +1401,7 @@ int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed,
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_exp(recursive, include_reclaimed);
+		auto rp = lotman::Lot::get_lots_past_exp(query_time, recursive, include_reclaimed);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1435,7 +1436,8 @@ int lotman_get_lots_past_exp(const bool recursive, const bool include_reclaimed,
 	}
 }
 
-int lotman_get_lots_past_del(const bool recursive, const bool include_reclaimed, char ***output, char **err_msg) {
+int lotman_get_lots_past_del(int64_t query_time, const bool recursive, const bool include_reclaimed, char ***output,
+							 char **err_msg) {
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1447,7 +1449,7 @@ int lotman_get_lots_past_del(const bool recursive, const bool include_reclaimed,
 			return -1;
 		}
 
-		auto rp = lotman::Lot::get_lots_past_del(recursive, include_reclaimed);
+		auto rp = lotman::Lot::get_lots_past_del(query_time, recursive, include_reclaimed);
 		if (!rp.second.empty()) {
 			if (err_msg) {
 				std::string int_err = rp.second;
@@ -1708,6 +1710,114 @@ int lotman_list_all_lots(char ***output, char **err_msg) {
 	}
 }
 
+// Helper: build the JSON object for a single lot. Caller is responsible for
+// ensuring the lot exists and that update_db_children_usage has been invoked
+// once for the batch (so this helper can be called many times in a row from
+// list-returning APIs without re-running expensive work each iteration).
+// Mirrors the field set documented for lotman_get_lot_as_json.
+static std::pair<json, std::string> build_lot_json_obj(const std::string &lot_name, bool recursive) {
+	json output_obj;
+	output_obj["lot_name"] = lot_name;
+
+	lotman::Lot lot(lot_name);
+
+	auto rp_owners = lot.get_owners(recursive);
+	if (!rp_owners.second.empty()) {
+		return {json(), "Failure on call to get_owners: " + rp_owners.second};
+	}
+	if (recursive) {
+		output_obj["owners"] = rp_owners.first;
+	} else {
+		if (rp_owners.first.empty()) {
+			return {json(), "get_owners returned empty result"};
+		}
+		output_obj["owner"] = rp_owners.first[0];
+	}
+
+	auto rp_parents = lot.get_parents(recursive, true);
+	if (!rp_parents.second.empty()) {
+		return {json(), "Failure on call to get_parents: " + rp_parents.second};
+	}
+	std::vector<std::string> tmp;
+	for (const auto &parent : rp_parents.first) {
+		tmp.push_back(parent.lot_name);
+	}
+	output_obj["parents"] = tmp;
+
+	auto rp_children = lot.get_children(recursive, false);
+	if (!rp_children.second.empty()) {
+		return {json(), "Failure on call to get_children: " + rp_children.second};
+	}
+	tmp.clear();
+	for (const auto &child : rp_children.first) {
+		tmp.push_back(child.lot_name);
+	}
+	output_obj["children"] = tmp;
+
+	auto rp_dirs = lot.get_lot_dirs(recursive);
+	if (!rp_dirs.second.empty()) {
+		return {json(), "Failure on call to get_lot_dirs: " + rp_dirs.second};
+	}
+	output_obj["paths"] = rp_dirs.first;
+
+	std::array<std::string, 6> man_pol_keys = {"dedicated_GB",	"opportunistic_GB", "max_num_objects",
+											   "creation_time", "deletion_time",	"expiration_time"};
+	json internal_man_pol_obj;
+	json internal_man_pol_obj_restrictive;
+	for (const auto &key : man_pol_keys) {
+		auto rp_attr = lot.get_restricting_attribute(key, false);
+		if (!rp_attr.second.empty()) {
+			return {json(), "Failure on call to get_restricting_attribute: " + rp_attr.second};
+		}
+		internal_man_pol_obj[key] = rp_attr.first["value"];
+
+		if (recursive) {
+			auto rp_attr_rec = lot.get_restricting_attribute(key, true);
+			if (!rp_attr_rec.second.empty()) {
+				return {json(), "Failure on call to get_restricting_attribute: " + rp_attr_rec.second};
+			}
+			internal_man_pol_obj_restrictive[key] = rp_attr_rec.first;
+		}
+	}
+	output_obj["management_policy_attrs"] = internal_man_pol_obj;
+	if (recursive) {
+		output_obj["restrictive_management_policy_attrs"] = internal_man_pol_obj_restrictive;
+	}
+
+	std::array<std::string, 6> usage_keys = {"dedicated_GB", "opportunistic_GB", "total_GB",
+											 "num_objects",	 "GB_being_written", "objects_being_written"};
+	json internal_usage_obj;
+	for (const auto &key : usage_keys) {
+		auto rp_usage = lot.get_lot_usage(key, recursive);
+		if (!rp_usage.second.empty()) {
+			return {json(), "Failure on call to get_lot_usage: " + rp_usage.second};
+		}
+		internal_usage_obj[key] = rp_usage.first;
+	}
+	output_obj["usage"] = internal_usage_obj;
+
+	auto rp_attr = lot.get_parent_attributions();
+	if (!rp_attr.second.empty()) {
+		return {json(), "Failure on call to get_parent_attributions: " + rp_attr.second};
+	}
+	output_obj["parent_attributions"] = rp_attr.first;
+
+	try {
+		auto &storage = lotman::db::StorageManager::get_storage();
+		auto reclaim_row = storage.get_pointer<lotman::db::Reclamation>(lot_name);
+		if (reclaim_row) {
+			json r;
+			r["reclaimed_at"] = reclaim_row->reclaimed_at;
+			r["reason"] = reclaim_row->reclaimed_reason;
+			output_obj["reclamation"] = r;
+		}
+	} catch (const std::exception &e) {
+		return {json(), std::string("Failure on reclamation lookup: ") + e.what()};
+	}
+
+	return {output_obj, ""};
+}
+
 // Given a lot_name and a recursive flag, generate the lot's information and return it as JSON. Recursive in this case
 // indicates that we want to look up/down the tree of lots to determine the most restrictive values associated with
 // parents/children.
@@ -1745,180 +1855,16 @@ int lotman_get_lot_as_json(const char *lot_name, const bool recursive, char **ou
 			return -1;
 		}
 
-		lotman::Lot lot(lot_name);
-
-		json output_obj;
-		// Start populating fields in output_obj
-
-		// Add name
-		output_obj["lot_name"] = lot_name;
-
-		// Add owner(s) according to recursive flag
-		std::pair<std::vector<std::string>, std::string> rp_vec_str;
-		rp_vec_str = lot.get_owners(recursive);
-		if (!rp_vec_str.second.empty()) { // There was an error
+		auto rp_obj = build_lot_json_obj(lot_name, recursive);
+		if (!rp_obj.second.empty()) {
 			if (err_msg) {
-				std::string int_err = rp_vec_str.second;
-				std::string ext_err = "Failure on call to get_owners: ";
-				*err_msg = strdup((ext_err + int_err).c_str());
-			}
-			return -1;
-		}
-		if (recursive) {
-			output_obj["owners"] = rp_vec_str.first;
-		} else {
-			if (rp_vec_str.first.empty()) {
-				if (err_msg) {
-					*err_msg = strdup("get_owners returned empty result");
-				}
-				return -1;
-			}
-			output_obj["owner"] = rp_vec_str.first[0]; // Only one owner, this is where it will be.
-		}
-
-		// Add parents according to recursive flag
-		std::pair<std::vector<lotman::Lot>, std::string> rp_lotvec_str;
-		rp_lotvec_str = lot.get_parents(recursive, true);
-		if (!rp_lotvec_str.second.empty()) { // There was an error
-			if (err_msg) {
-				std::string int_err = rp_lotvec_str.second;
-				std::string ext_err = "Failure on call to get_parents: ";
-				*err_msg = strdup((ext_err + int_err).c_str());
-			}
-			return -1;
-		}
-		std::vector<std::string> tmp;
-		for (const auto &parent : rp_lotvec_str.first) {
-			tmp.push_back(parent.lot_name);
-		}
-		output_obj["parents"] = tmp;
-
-		// Add children according to recursive flag
-		rp_lotvec_str = lot.get_children(recursive, false);
-		if (!rp_lotvec_str.second.empty()) { // There was an error
-			if (err_msg) {
-				std::string int_err = rp_lotvec_str.second;
-				std::string ext_err = "Failure on call to get_children: ";
-				*err_msg = strdup((ext_err + int_err).c_str());
-			}
-			return -1;
-		}
-		tmp = {};
-		for (const auto &child : rp_lotvec_str.first) {
-			tmp.push_back(child.lot_name);
-		}
-		output_obj["children"] = tmp;
-
-		// Add paths according to recursive flag
-		std::pair<json, std::string> rp_json_str;
-		rp_json_str = lot.get_lot_dirs(recursive);
-		if (!rp_json_str.second.empty()) { // There was an error
-			if (err_msg) {
-				std::string int_err = rp_json_str.second;
-				std::string ext_err = "Failure on call to get_lot_dirs: ";
-				*err_msg = strdup((ext_err + int_err).c_str());
-			}
-			return -1;
-		}
-		output_obj["paths"] = rp_json_str.first;
-
-		// Add management policy attributes according to recursive flag
-		std::array<std::string, 6> man_pol_keys = {"dedicated_GB",	"opportunistic_GB", "max_num_objects",
-												   "creation_time", "deletion_time",	"expiration_time"};
-		json internal_man_pol_obj;
-		json internal_man_pol_obj_restrictive;
-		for (const auto &key : man_pol_keys) {
-			rp_json_str = lot.get_restricting_attribute(key, false);
-			if (!rp_json_str.second.empty()) { // There was an error
-				if (err_msg) {
-					std::string int_err = rp_json_str.second;
-					std::string ext_err = "Failure on call to get_restricting_attribute: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
-				}
-				return -1;
-			}
-
-			internal_man_pol_obj[key] = rp_json_str.first["value"];
-
-			if (recursive) {
-				rp_json_str = lot.get_restricting_attribute(key, true);
-				if (!rp_json_str.second.empty()) { // There was an error
-					if (err_msg) {
-						std::string int_err = rp_json_str.second;
-						std::string ext_err = "Failure on call to get_restricting_attribute: ";
-						*err_msg = strdup((ext_err + int_err).c_str());
-					}
-					return -1;
-				}
-
-				internal_man_pol_obj_restrictive[key] = rp_json_str.first;
-			}
-		}
-		output_obj["management_policy_attrs"] = internal_man_pol_obj;
-
-		if (recursive) {
-			output_obj["restrictive_management_policy_attrs"] = internal_man_pol_obj_restrictive;
-		}
-
-		// Add usage according to recursive flag
-		std::array<std::string, 6> usage_keys = {"dedicated_GB", "opportunistic_GB", "total_GB",
-												 "num_objects",	 "GB_being_written", "objects_being_written"};
-		json internal_usage_obj;
-		for (const auto &key : usage_keys) {
-			rp_json_str = lot.get_lot_usage(key, recursive);
-			if (!rp_json_str.second.empty()) { // There was an error
-				if (err_msg) {
-					std::string int_err = rp_json_str.second;
-					std::string ext_err = "Failure on call to get_lot_usage: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
-				}
-				return -1;
-			}
-			internal_usage_obj[key] = rp_json_str.first;
-		}
-		output_obj["usage"] = internal_usage_obj;
-
-		// Add per-parent attributions. Always emitted (as an object, possibly
-		// empty) so callers can round-trip create-then-read and audit the
-		// attribution graph. Self-parent-only lots simply produce {}.
-		{
-			auto rp_attr = lot.get_parent_attributions();
-			if (!rp_attr.second.empty()) {
-				if (err_msg) {
-					std::string int_err = rp_attr.second;
-					std::string ext_err = "Failure on call to get_parent_attributions: ";
-					*err_msg = strdup((ext_err + int_err).c_str());
-				}
-				return -1;
-			}
-			output_obj["parent_attributions"] = rp_attr.first;
-		}
-
-		// Reclamation: emit the ledger row when one exists. Future-dated
-		// reclamations are still surfaced here so callers can see scheduled
-		// reclaim events; runtime filters elsewhere apply `reclaimed_at <= now`.
-		try {
-			auto &storage = lotman::db::StorageManager::get_storage();
-			auto reclaim_row = storage.get_pointer<lotman::db::Reclamation>(lot_name);
-			if (reclaim_row) {
-				json r;
-				r["reclaimed_at"] = reclaim_row->reclaimed_at;
-				r["reason"] = reclaim_row->reclaimed_reason;
-				output_obj["reclamation"] = r;
-			}
-		} catch (const std::exception &e) {
-			if (err_msg) {
-				std::string msg = std::string("Failure on reclamation lookup: ") + e.what();
-				*err_msg = strdup(msg.c_str());
+				*err_msg = strdup(rp_obj.second.c_str());
 			}
 			return -1;
 		}
 
-		// Copy the object to output
-		std::string output_str = output_obj.dump();
-		auto output_str_c = static_cast<char *>(malloc(sizeof(char) * (output_str.length() + 1)));
-		output_str_c = strdup(output_str.c_str());
-		*output = output_str_c;
+		std::string output_str = rp_obj.first.dump();
+		*output = strdup(output_str.c_str());
 		return 0;
 	} catch (std::exception &exc) {
 		if (err_msg) {
@@ -1959,6 +1905,64 @@ int lotman_get_lots_from_dir(const char *dir, const bool recursive, int64_t quer
 			idx++;
 		}
 		*output = lots_from_dir_c;
+		return 0;
+	} catch (std::exception &exc) {
+		if (err_msg) {
+			*err_msg = strdup(exc.what());
+		}
+		return -1;
+	}
+}
+
+int lotman_get_lots_for_path(const char *path, bool recursive, int64_t time_lo_ms, int64_t time_hi_ms,
+							 bool include_reclaimed, char **output, char **err_msg) {
+	try {
+		if (!path) {
+			if (err_msg) {
+				*err_msg = strdup("path must not be nullpointer.");
+			}
+			return -1;
+		}
+
+		auto rp_bool_str = lotman::Lot::update_db_children_usage();
+		if (!rp_bool_str.first) {
+			if (err_msg) {
+				std::string int_err = rp_bool_str.second;
+				std::string ext_err = "Failure on call to update_db_children_usage(): ";
+				*err_msg = strdup((ext_err + int_err).c_str());
+			}
+			return -1;
+		}
+
+		auto rp = lotman::Lot::get_lots_for_path(path, recursive, time_lo_ms, time_hi_ms, include_reclaimed);
+		if (!rp.second.empty()) {
+			if (err_msg) {
+				std::string ext_err = "Failure on call to get_lots_for_path: ";
+				*err_msg = strdup((ext_err + rp.second).c_str());
+			}
+			return -1;
+		}
+
+		// Build a JSON array, one full lot object per winner. Use the same
+		// shape as lotman_get_lot_as_json(name, recursive=false) so callers
+		// can treat each element identically. update_db_children_usage was
+		// already called once above, so build_lot_json_obj is cheap to call
+		// per-lot here.
+		json arr = json::array();
+		for (const auto &lot_name : rp.first) {
+			auto rp_obj = build_lot_json_obj(lot_name, /*recursive=*/false);
+			if (!rp_obj.second.empty()) {
+				if (err_msg) {
+					std::string ext_err = "Failure building JSON for lot '" + lot_name + "': ";
+					*err_msg = strdup((ext_err + rp_obj.second).c_str());
+				}
+				return -1;
+			}
+			arr.push_back(rp_obj.first);
+		}
+
+		std::string output_str = arr.dump();
+		*output = strdup(output_str.c_str());
 		return 0;
 	} catch (std::exception &exc) {
 		if (err_msg) {
