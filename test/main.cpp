@@ -1,4 +1,5 @@
 #include "../src/lotman.h"
+#include "test_utils.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -10,23 +11,6 @@
 #include <typeinfo>
 
 using json = nlohmann::json;
-
-// RAII wrappers for C-style memory management
-struct CStringDeleter {
-	void operator()(char *ptr) const {
-		if (ptr)
-			free(ptr);
-	}
-};
-using UniqueCString = std::unique_ptr<char, CStringDeleter>;
-
-struct StringListDeleter {
-	void operator()(char **ptr) const {
-		if (ptr)
-			lotman_free_string_list(ptr);
-	}
-};
-using UniqueStringList = std::unique_ptr<char *, StringListDeleter>;
 
 // Test class to handle setup and teardown for each individual test
 class LotManTest : public ::testing::Test {
@@ -1265,7 +1249,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	char **raw_output = nullptr;
 
 	// Check for lots past expiration
-	auto rv = lotman_get_lots_past_exp(true, /*include_reclaimed=*/true, &raw_output, &raw_err);
+	auto rv = lotman_get_lots_past_exp(test_now_ms(), true, /*include_reclaimed=*/true, &raw_output, &raw_err);
 	UniqueCString err_msg(raw_err);
 	UniqueStringList output(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();
@@ -1281,7 +1265,7 @@ TEST_F(LotManTest, LotsQueryTest) {
 	// Check for lots past deletion
 	raw_output = nullptr;
 	raw_err = nullptr;
-	rv = lotman_get_lots_past_del(true, /*include_reclaimed=*/true, &raw_output, &raw_err);
+	rv = lotman_get_lots_past_del(test_now_ms(), true, /*include_reclaimed=*/true, &raw_output, &raw_err);
 	err_msg.reset(raw_err);
 	UniqueStringList output2(raw_output);
 	ASSERT_EQ(rv, 0) << err_msg.get();

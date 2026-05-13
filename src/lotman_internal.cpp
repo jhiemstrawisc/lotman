@@ -2418,17 +2418,17 @@ std::pair<bool, std::string> lotman::Lot::update_usage_by_dirs(const json &updat
 }
 
 // Helper: if include_reclaimed is false, filter out any lot whose reclamation
-// row exists with reclaimed_at <= now. Centralizes the post-filter applied to
-// every get_lots_past_* result so that cleanup loops do not repeatedly process
-// already-reclaimed lots.
-static void filter_reclaimed_in_place(std::vector<std::string> &lots, bool include_reclaimed) {
+// row exists with reclaimed_at <= query_time. Centralizes the post-filter
+// applied to every get_lots_past_* result so that cleanup loops do not
+// repeatedly process already-reclaimed lots. The caller supplies the
+// timestamp used both as the reclamation cutoff; pass wall-clock now() for
+// the historical "as-of-now" semantics.
+static void filter_reclaimed_in_place(std::vector<std::string> &lots, bool include_reclaimed, int64_t query_time) {
 	if (include_reclaimed || lots.empty()) {
 		return;
 	}
-	auto now = std::chrono::system_clock::now();
-	int64_t now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
 	auto new_end = std::remove_if(lots.begin(), lots.end(), [&](const std::string &name) {
-		auto rp = lotman::Lot::is_reclaimed(name, now_ms);
+		auto rp = lotman::Lot::is_reclaimed(name, query_time);
 		if (!rp.second.empty()) {
 			// On lookup error, conservatively leave the lot in.
 			return false;
@@ -2438,24 +2438,35 @@ static void filter_reclaimed_in_place(std::vector<std::string> &lots, bool inclu
 	lots.erase(new_end, lots.end());
 }
 
-std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(const bool recursive,
-																				const bool include_reclaimed) {
-	auto rp_inner = get_lots_past_exp(recursive);
+// Convenience overload: existing quota past_* APIs (past_opp/past_ded/past_obj)
+// continue to use wall-clock now() for reclamation evaluation, since their
+// result already reflects current usage rather than a caller-supplied time.
+static void filter_reclaimed_in_place(std::vector<std::string> &lots, bool include_reclaimed) {
+	if (include_reclaimed || lots.empty()) {
+		return;
+	}
+	auto now = std::chrono::system_clock::now();
+	int64_t now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
+	filter_reclaimed_in_place(lots, include_reclaimed, now_ms);
+}
+
+std::pair<std::vector<std::string>, std::string>
+lotman::Lot::get_lots_past_exp(int64_t query_time, const bool recursive, const bool include_reclaimed) {
+	auto rp_inner = get_lots_past_exp(query_time, recursive);
 	if (!rp_inner.second.empty()) {
 		return rp_inner;
 	}
-	filter_reclaimed_in_place(rp_inner.first, include_reclaimed);
+	filter_reclaimed_in_place(rp_inner.first, include_reclaimed, query_time);
 	return rp_inner;
 }
 
-std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(const bool recursive) {
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(int64_t query_time,
+																				const bool recursive) {
 	std::vector<std::string> expired_lots;
-	auto now = std::chrono::system_clock::now();
-	int64_t ms_since_epoch = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
 
 	std::string expired_query =
 		"SELECT lot_name FROM management_policy_attributes WHERE expiration_time != 0 AND expiration_time <= ?;";
-	std::map<int64_t, std::vector<int>> expired_map{{ms_since_epoch, {1}}};
+	std::map<int64_t, std::vector<int>> expired_map{{query_time, {1}}};
 	auto rp = lotman::db::SQL_get_matches(expired_query, std::map<std::string, std::vector<int>>(), expired_map);
 	if (!rp.second.empty()) { // There was an error
 		std::string int_err = rp.second;
@@ -2490,23 +2501,21 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_exp(
 	return std::make_pair(expired_lots, "");
 }
 
-std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_del(const bool recursive,
-																				const bool include_reclaimed) {
-	auto rp_inner = get_lots_past_del(recursive);
+std::pair<std::vector<std::string>, std::string>
+lotman::Lot::get_lots_past_del(int64_t query_time, const bool recursive, const bool include_reclaimed) {
+	auto rp_inner = get_lots_past_del(query_time, recursive);
 	if (!rp_inner.second.empty()) {
 		return rp_inner;
 	}
-	filter_reclaimed_in_place(rp_inner.first, include_reclaimed);
+	filter_reclaimed_in_place(rp_inner.first, include_reclaimed, query_time);
 	return rp_inner;
 }
 
-std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_del(const bool recursive) {
-	auto now = std::chrono::system_clock::now();
-	int64_t ms_since_epoch = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
-
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_past_del(int64_t query_time,
+																				const bool recursive) {
 	std::string deletion_query =
 		"SELECT lot_name FROM management_policy_attributes WHERE deletion_time != 0 AND deletion_time <= ?;";
-	std::map<int64_t, std::vector<int>> deletion_map{{ms_since_epoch, {1}}};
+	std::map<int64_t, std::vector<int>> deletion_map{{query_time, {1}}};
 	auto rp = lotman::db::SQL_get_matches(deletion_query, std::map<std::string, std::vector<int>>(), deletion_map);
 	if (!rp.second.empty()) { // There was an error
 		std::string int_err = rp.second;
@@ -3136,6 +3145,235 @@ lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursiv
 	return std::make_pair(matching_lots_vec, "");
 }
 
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_for_path(const std::string &path_input,
+																				bool recursive, int64_t time_lo_ms,
+																				int64_t time_hi_ms,
+																				bool include_reclaimed) {
+	if (time_hi_ms <= time_lo_ms) {
+		return std::make_pair(std::vector<std::string>(),
+							  "Invalid time window: time_hi_ms must be strictly greater than time_lo_ms");
+	}
+
+	// Same path-normalization convention as get_lots_from_dir: stored paths
+	// always have a trailing slash; the input path is normalized to match,
+	// while a separate "no trailing slash" form is used on the LIKE side so
+	// that "/foobar" cannot accidentally match a stored path of "/foo/".
+	std::string dir = ensure_trailing_slash(path_input);
+	std::string dir_for_like = dir;
+	if (dir_for_like.length() > 1 && dir_for_like.back() == '/') {
+		dir_for_like.pop_back();
+	}
+
+	// Per-lot candidate query: gather every lot with at least one *included*
+	// matching path row, the longest such path's length (its "claim length"),
+	// the lot's own active window, and any reclamation row. The NOT EXISTS
+	// guard mirrors get_lots_from_dir: an inclusion of length L is dropped
+	// when the same lot has a longer matching exclusion. Because we then
+	// take MAX(LENGTH(p.path)), exclusions shorter than the longest inclusion
+	// have no effect; longer exclusions correctly suppress shorter inclusions.
+	//
+	// Active-window predicate is the half-open overlap of the lot's MPA
+	// interval with [time_lo_ms, time_hi_ms), with the all-zero sentinel
+	// triple treated as always-live. Reclamation pre-filtering (drop lots
+	// reclaimed at or before time_lo_ms) is applied here only when
+	// include_reclaimed=false; mid-window reclamation clipping is applied in
+	// C++ below using the returned reclaimed_at value.
+	std::string base_query = "SELECT p.lot_name, MAX(LENGTH(p.path)) AS claim_len, "
+							 "       mpa.creation_time, mpa.expiration_time, "
+							 "       COALESCE(r.reclaimed_at, 0) "
+							 "FROM paths p "
+							 "JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
+							 "LEFT JOIN reclamations r ON r.lot_name = p.lot_name "
+							 "WHERE (p.path = ?1 OR ?2 LIKE p.path || '%') "
+							 "  AND (p.recursive OR p.path = ?3) "
+							 "  AND p.exclude = 0 "
+							 "  AND ((mpa.creation_time = 0 AND mpa.expiration_time = 0 AND mpa.deletion_time = 0) "
+							 "       OR (mpa.creation_time < ?5 AND mpa.expiration_time > ?4)) ";
+	if (!include_reclaimed) {
+		base_query += "  AND (r.lot_name IS NULL OR r.reclaimed_at > ?4) ";
+	}
+	base_query += "  AND NOT EXISTS ( "
+				  "      SELECT 1 FROM paths e "
+				  "      WHERE e.lot_name = p.lot_name "
+				  "        AND e.exclude = 1 "
+				  "        AND (e.path = ?1 OR ?2 LIKE e.path || '%') "
+				  "        AND (e.recursive OR e.path = ?3) "
+				  "        AND LENGTH(e.path) > LENGTH(p.path) "
+				  "  ) "
+				  "GROUP BY p.lot_name, mpa.creation_time, mpa.expiration_time, r.reclaimed_at;";
+
+	std::map<std::string, std::vector<int>> str_map{{dir, {1, 3}}, {dir_for_like, {2}}};
+	std::map<int64_t, std::vector<int>> int_map{{time_lo_ms, {4}}, {time_hi_ms, {5}}};
+	auto rp = lotman::db::SQL_get_matches_multi_col(base_query, 5, str_map, int_map);
+	if (!rp.second.empty()) {
+		return std::make_pair(std::vector<std::string>(),
+							  std::string("Failure on call to SQL_get_matches_multi_col: ") + rp.second);
+	}
+
+	struct Candidate {
+		std::string lot_name;
+		int64_t active_start;
+		int64_t active_end;
+		int claim_len;
+	};
+	std::vector<Candidate> candidates;
+	candidates.reserve(rp.first.size());
+
+	for (const auto &row : rp.first) {
+		if (row.size() < 5) {
+			continue;
+		}
+		Candidate c;
+		c.lot_name = row[0];
+		try {
+			c.claim_len = std::stoi(row[1]);
+		} catch (...) {
+			c.claim_len = 0;
+		}
+		int64_t creation = 0;
+		int64_t expiration = 0;
+		int64_t reclaimed_at = 0;
+		try {
+			creation = static_cast<int64_t>(std::stoll(row[2]));
+			expiration = static_cast<int64_t>(std::stoll(row[3]));
+			reclaimed_at = static_cast<int64_t>(std::stoll(row[4]));
+		} catch (...) {
+			continue;
+		}
+
+		// Compute the lot's active window inside [time_lo_ms, time_hi_ms).
+		// Sentinel (all-zero) MPAs treat the lot as always-live, so the
+		// active window equals the query window; the SQL above already
+		// requires deletion_time=0 alongside creation/expiration=0 for the
+		// sentinel branch, so we can reliably detect it via creation==0
+		// and expiration==0 here.
+		int64_t start;
+		int64_t end;
+		if (creation == 0 && expiration == 0) {
+			start = time_lo_ms;
+			end = time_hi_ms;
+		} else {
+			start = std::max<int64_t>(creation, time_lo_ms);
+			end = std::min<int64_t>(expiration, time_hi_ms);
+		}
+		// Mid-window reclamation clipping: only applies when filtering and
+		// when the row's reclaimed_at falls strictly inside the window.
+		// reclaimed_at <= time_lo cases were already dropped by the SQL
+		// pre-filter; we never store reclaimed_at == 0 in practice (the
+		// public API rejects it), so we use 0 as "no reclamation" via the
+		// COALESCE above.
+		if (!include_reclaimed && reclaimed_at > 0 && reclaimed_at < end) {
+			end = reclaimed_at;
+		}
+		if (end <= start) {
+			continue;
+		}
+		c.active_start = start;
+		c.active_end = end;
+		candidates.push_back(std::move(c));
+	}
+
+	// Per-candidate sweep: a lot wins iff some instant in its active interval
+	// is NOT covered by the active interval of any candidate with a strictly
+	// greater claim length. Ties at the same claim_len do not shadow each
+	// other, so both tied lots can win simultaneously. (Same-path collisions
+	// during overlapping windows are rejected at insert time, so genuine ties
+	// at the maximum claim length are rare in practice.)
+	auto interval_union_covers = [](std::vector<std::pair<int64_t, int64_t>> intervals, int64_t target_start,
+									int64_t target_end) -> bool {
+		if (intervals.empty()) {
+			return target_end <= target_start;
+		}
+		std::sort(intervals.begin(), intervals.end());
+		int64_t cursor = target_start;
+		for (const auto &iv : intervals) {
+			if (iv.first > cursor) {
+				return false;
+			}
+			cursor = std::max(cursor, iv.second);
+			if (cursor >= target_end) {
+				return true;
+			}
+		}
+		return cursor >= target_end;
+	};
+
+	std::vector<std::string> winners;
+	for (const auto &c : candidates) {
+		std::vector<std::pair<int64_t, int64_t>> shadowing;
+		for (const auto &other : candidates) {
+			if (other.claim_len <= c.claim_len) {
+				continue;
+			}
+			int64_t s = std::max(other.active_start, c.active_start);
+			int64_t e = std::min(other.active_end, c.active_end);
+			if (s < e) {
+				shadowing.emplace_back(s, e);
+			}
+		}
+		if (!interval_union_covers(shadowing, c.active_start, c.active_end)) {
+			winners.push_back(c.lot_name);
+		}
+	}
+
+	// Default-lot fallback: emit "default" iff some instant in the window
+	// has no candidate active at all (matching get_lots_from_dir's behavior
+	// when no path row resolves).
+	{
+		std::vector<std::pair<int64_t, int64_t>> all_intervals;
+		all_intervals.reserve(candidates.size());
+		for (const auto &c : candidates) {
+			all_intervals.emplace_back(c.active_start, c.active_end);
+		}
+		if (!interval_union_covers(all_intervals, time_lo_ms, time_hi_ms)) {
+			winners.push_back("default");
+		}
+	}
+
+	// Note: winners cannot contain duplicates here. Each lot appears at most
+	// once in `candidates` (the SQL groups by lot_name), and "default" is
+	// appended at most once by the fallback above. The recursive ancestor
+	// expansion below uses a `seen` set seeded from winners, so it cannot
+	// introduce duplicates either.
+
+	if (recursive) {
+		// Append ancestors of every winner. An ancestor is suppressed only
+		// when filtering reclaimed lots AND the ancestor is reclaimed for
+		// the entirety of the window (reclaimed_at <= time_lo_ms), matching
+		// the union-of-winners semantics: an ancestor reclaimed mid-window
+		// was still alive earlier, so it should still surface.
+		std::set<std::string> seen(winners.begin(), winners.end());
+		std::vector<std::string> additions;
+		for (const auto &name : winners) {
+			if (name == "default") {
+				continue;
+			}
+			Lot lot(name);
+			lot.get_parents(true, false);
+			for (const auto &parent : lot.recursive_parents) {
+				if (seen.count(parent.lot_name)) {
+					continue;
+				}
+				if (!include_reclaimed) {
+					auto rec_rp = is_reclaimed(parent.lot_name, time_lo_ms);
+					if (!rec_rp.second.empty()) {
+						return std::make_pair(std::vector<std::string>(), "Failure checking reclamation for parent '" +
+																			  parent.lot_name + "': " + rec_rp.second);
+					}
+					if (rec_rp.first) {
+						continue;
+					}
+				}
+				seen.insert(parent.lot_name);
+				additions.push_back(parent.lot_name);
+			}
+		}
+		winners.insert(winners.end(), additions.begin(), additions.end());
+	}
+
+	return std::make_pair(winners, "");
+}
+
 std::pair<bool, std::string> lotman::Lot::check_context_for_parents(const std::vector<std::string> &parents,
 																	bool include_self, bool new_lot) {
 	if (new_lot && parents.size() == 1 &&
@@ -3185,6 +3423,7 @@ std::pair<bool, std::string> lotman::Lot::check_context_for_parents(const std::v
 
 	return std::make_pair(true, "");
 }
+
 std::pair<bool, std::string> lotman::Lot::check_context_for_parents(const std::vector<Lot> &parents, bool include_self,
 																	bool new_lot) {
 	if (new_lot && parents.size() == 1 &&
