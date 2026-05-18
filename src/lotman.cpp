@@ -6,9 +6,32 @@
 #include "schemas.h"
 
 #include <chrono>
+#include <mutex>
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
 #include <string.h>
+
+// Process-wide mutex serializing every public lotman_* C API entry point.
+//
+// libLotMan internally uses a singleton SQLite handle (see StorageManager in
+// lotman_db.h). SQLite is built without SQLITE_OPEN_FULLMUTEX, and
+// sqlite_orm's prepared-statement cache is not thread-safe either, so
+// concurrent access from multiple OS threads corrupts the connection and
+// crashes (typically inside update_db_children_usage()).
+//
+// In practice this matters because libLotMan is loaded into a single process
+// by *two* runtimes that the library itself cannot coordinate: Pelican's Go
+// code (renewal / GC goroutines) and xrootd's C++ purge thread
+// (XrdPurgeLotMan). Each runtime can supply its own mutex for its own
+// callers, but they share no synchronization primitive across the language
+// boundary. The only place where both can be serialized correctly is inside
+// libLotMan itself.
+//
+// The mutex is recursive because a few public entry points internally
+// re-enter other public entry points (notably the past_* readers call into
+// update helpers).
+static std::recursive_mutex g_lotman_api_mutex;
+#define LOTMAN_API_LOCK() std::lock_guard<std::recursive_mutex> _lotman_api_lock(g_lotman_api_mutex)
 
 /*
 Initialize some context globals
@@ -73,6 +96,7 @@ int reject_if_reclaimed(const std::string &lot_name, const char *op, char **err_
 } // namespace
 
 int lotman_add_lot(const char *lotman_JSON_str, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json lot_JSON_obj = json::parse(lotman_JSON_str);
 
@@ -183,6 +207,7 @@ int lotman_add_lot(const char *lotman_JSON_str, char **err_msg) {
 int lotman_remove_lot(const char *lot_name, const bool assign_LTBR_parent_as_parent_to_orphans,
 					  const bool assign_LTBR_parent_as_parent_to_non_orphans, const bool assign_policy_to_children,
 					  const bool override_policy, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp = lotman::Lot::lot_exists(lot_name);
 		if (!rp.first) {
@@ -278,6 +303,7 @@ int lotman_remove_lot(const char *lot_name, const bool assign_LTBR_parent_as_par
 }
 
 int lotman_remove_lots_recursive(const char *lot_name, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp = lotman::Lot::lot_exists(lot_name);
 		if (!rp.first) {
@@ -327,6 +353,7 @@ int lotman_remove_lots_recursive(const char *lot_name, char **err_msg) {
 }
 
 int lotman_reclaim_lot(const char *lot_name, int64_t reclaimed_at, const char *reason, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!lot_name) {
 			if (err_msg) {
@@ -393,6 +420,7 @@ int lotman_reclaim_lot(const char *lot_name, int64_t reclaimed_at, const char *r
 }
 
 int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json update_JSON_obj = json::parse(lotman_JSON_str);
 
@@ -564,6 +592,7 @@ int lotman_update_lot(const char *lotman_JSON_str, char **err_msg) {
 }
 
 int lotman_rm_parents_from_lot(const char *lotman_JSON_str, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json subtraction_JSON_obj = json::parse(lotman_JSON_str);
 		// Validate the incoming JSON
@@ -625,6 +654,7 @@ int lotman_rm_parents_from_lot(const char *lotman_JSON_str, char **err_msg) {
 }
 
 int lotman_rm_paths_from_lots(const char *lotman_JSON_str, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json subtraction_JSON_obj = json::parse(lotman_JSON_str);
 		// Validate the incoming JSON
@@ -729,6 +759,7 @@ int lotman_rm_paths_from_lots(const char *lotman_JSON_str, char **err_msg) {
 }
 
 int lotman_add_to_lot(const char *lotman_JSON_str, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json addition_obj = json::parse(lotman_JSON_str);
 
@@ -836,6 +867,7 @@ int lotman_add_to_lot(const char *lotman_JSON_str, char **err_msg) {
 }
 
 int lotman_is_root(const char *lot_name, char **err_msg) {
+	LOTMAN_API_LOCK();
 	if (!lot_name) {
 		if (err_msg) {
 			*err_msg = strdup("Name for the lot whose rootness is to be determined must not be nullpointer.");
@@ -879,6 +911,7 @@ int lotman_is_root(const char *lot_name, char **err_msg) {
 }
 
 int lotman_lot_exists(const char *lot_name, char **err_msg) {
+	LOTMAN_API_LOCK();
 	if (!lot_name) {
 		if (err_msg) {
 			*err_msg = strdup("Name for the lot whose existence is to be determined must not be nullpointer.");
@@ -908,6 +941,7 @@ int lotman_lot_exists(const char *lot_name, char **err_msg) {
 }
 
 int lotman_get_owners(const char *lot_name, const bool recursive, char ***output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	if (!lot_name) {
 		if (err_msg) {
 			*err_msg = strdup("Name for the lot whose owners are to be obtained must not be nullpointer.");
@@ -967,6 +1001,7 @@ int lotman_get_owners(const char *lot_name, const bool recursive, char ***output
 }
 
 void lotman_free_string_list(char **str_list) {
+	LOTMAN_API_LOCK();
 	int idx = 0;
 	do {
 		free(str_list[idx++]);
@@ -976,6 +1011,7 @@ void lotman_free_string_list(char **str_list) {
 
 int lotman_get_parent_names(const char *lot_name, const bool recursive, const bool get_self, char ***output,
 							char **err_msg) {
+	LOTMAN_API_LOCK();
 	if (!lot_name) {
 		if (err_msg) {
 			*err_msg = strdup("Name for the lot whose parents are to be obtained must not be nullpointer.");
@@ -1041,6 +1077,7 @@ int lotman_get_parent_names(const char *lot_name, const bool recursive, const bo
 
 int lotman_get_children_names(const char *lot_name, const bool recursive, const bool get_self, char ***output,
 							  char **err_msg) {
+	LOTMAN_API_LOCK();
 	if (!lot_name) {
 		if (err_msg) {
 			*err_msg = strdup("Name for the lot whose children are to be obtained must not be nullpointer.");
@@ -1105,6 +1142,7 @@ int lotman_get_children_names(const char *lot_name, const bool recursive, const 
 }
 
 int lotman_get_policy_attributes(const char *policy_attributes_JSON_str, char **output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json get_attrs_obj = json::parse(policy_attributes_JSON_str);
 
@@ -1164,6 +1202,7 @@ int lotman_get_policy_attributes(const char *policy_attributes_JSON_str, char **
 }
 
 int lotman_get_lot_dirs(const char *lot_name, const bool recursive, char **output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	if (!lot_name) {
 		if (err_msg) {
 			*err_msg = strdup("Name for the lot whose directories are to be obtained must not be nullpointer.");
@@ -1214,6 +1253,7 @@ int lotman_get_lot_dirs(const char *lot_name, const bool recursive, char **outpu
 }
 
 int lotman_update_lot_usage(const char *update_JSON_str, bool deltaMode, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json update_usage_JSON = json::parse(update_JSON_str);
 
@@ -1280,6 +1320,7 @@ int lotman_update_lot_usage(const char *update_JSON_str, bool deltaMode, char **
 }
 
 int lotman_update_lot_usage_by_dir(const char *update_JSON_str, bool deltaMode, int64_t query_time, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json update_JSON = json::parse(update_JSON_str);
 
@@ -1315,6 +1356,7 @@ int lotman_update_lot_usage_by_dir(const char *update_JSON_str, bool deltaMode, 
 }
 
 int lotman_get_lot_usage(const char *usage_attributes_JSON_str, char **output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		json get_usage_obj = json::parse(usage_attributes_JSON_str);
 
@@ -1382,6 +1424,7 @@ int lotman_get_lot_usage(const char *usage_attributes_JSON_str, char **output, c
 }
 
 int lotman_check_db_health(char **err_msg) {
+	LOTMAN_API_LOCK();
 	if (err_msg) {
 		*err_msg = strdup("This function is not yet implemented...");
 	}
@@ -1390,6 +1433,7 @@ int lotman_check_db_health(char **err_msg) {
 
 int lotman_get_lots_past_exp(int64_t query_time, const bool recursive, const bool include_reclaimed, char ***output,
 							 char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1438,6 +1482,7 @@ int lotman_get_lots_past_exp(int64_t query_time, const bool recursive, const boo
 
 int lotman_get_lots_past_del(int64_t query_time, const bool recursive, const bool include_reclaimed, char ***output,
 							 char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1487,6 +1532,7 @@ int lotman_get_lots_past_del(int64_t query_time, const bool recursive, const boo
 
 int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
 							 char ***output, const bool hierarchical, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1536,6 +1582,7 @@ int lotman_get_lots_past_opp(const bool recursive_quota, const bool recursive_ch
 
 int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
 							 char ***output, const bool hierarchical, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1585,6 +1632,7 @@ int lotman_get_lots_past_ded(const bool recursive_quota, const bool recursive_ch
 
 int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_children, const bool include_reclaimed,
 							 char ***output, const bool hierarchical, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp_bool_str = lotman::Lot::update_db_children_usage();
 		if (!rp_bool_str.first) {
@@ -1634,6 +1682,7 @@ int lotman_get_lots_past_obj(const bool recursive_quota, const bool recursive_ch
 
 int lotman_get_available_capacity(const char *parent_lot_name, int64_t start_time, int64_t end_time, char **output,
 								  char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!parent_lot_name) {
 			if (err_msg) {
@@ -1673,6 +1722,7 @@ int lotman_get_available_capacity(const char *parent_lot_name, int64_t start_tim
 }
 
 int lotman_list_all_lots(char ***output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		auto rp = lotman::Lot::list_all_lots();
 		if (!rp.second.empty()) { // There was an error
@@ -1822,6 +1872,7 @@ static std::pair<json, std::string> build_lot_json_obj(const std::string &lot_na
 // indicates that we want to look up/down the tree of lots to determine the most restrictive values associated with
 // parents/children.
 int lotman_get_lot_as_json(const char *lot_name, const bool recursive, char **output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!lot_name) {
 			if (err_msg) {
@@ -1876,6 +1927,7 @@ int lotman_get_lot_as_json(const char *lot_name, const bool recursive, char **ou
 
 int lotman_get_lots_from_dir(const char *dir, const bool recursive, int64_t query_time, char ***output,
 							 char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 
 		auto rp = lotman::Lot::get_lots_from_dir(dir, recursive, query_time);
@@ -1916,6 +1968,7 @@ int lotman_get_lots_from_dir(const char *dir, const bool recursive, int64_t quer
 
 int lotman_get_lots_for_path(const char *path, bool recursive, int64_t time_lo_ms, int64_t time_hi_ms,
 							 bool include_reclaimed, char **output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!path) {
 			if (err_msg) {
@@ -1973,6 +2026,7 @@ int lotman_get_lots_for_path(const char *path, bool recursive, int64_t time_lo_m
 }
 
 int lotman_set_context_str(const char *key, const char *value, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!key) {
 			if (err_msg) {
@@ -2034,6 +2088,7 @@ int lotman_set_context_str(const char *key, const char *value, char **err_msg) {
 }
 
 int lotman_get_context_str(const char *key, char **output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!key) {
 			if (err_msg) {
@@ -2069,6 +2124,7 @@ int lotman_get_context_str(const char *key, char **output, char **err_msg) {
 }
 
 int lotman_set_context_int(const char *key, const int value, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!key) {
 			if (err_msg) {
@@ -2098,6 +2154,7 @@ int lotman_set_context_int(const char *key, const int value, char **err_msg) {
 }
 
 int lotman_get_context_int(const char *key, int *output, char **err_msg) {
+	LOTMAN_API_LOCK();
 	try {
 		if (!key) {
 			if (err_msg) {

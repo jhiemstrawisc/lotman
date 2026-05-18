@@ -2239,9 +2239,30 @@ std::pair<bool, std::string> lotman::Lot::recalculate_children_usage() {
 	std::vector<std::vector<std::string>> updated_usages;
 	if (recursive_children.size() > 0) {
 		std::map<std::string, std::vector<int>> sum_str_map{};
-		std::string sum_query =
-			"SELECT SUM(self_GB), SUM(self_GB_being_written), SUM(self_objects), SUM(self_objects_being_written) "
-			"FROM lot_usage WHERE lot_name IN (";
+		// BUGFIX: reclaimed lots must not contribute to their parents'
+		// children_* roll-up. Previously this SUM blindly summed self_*
+		// over every lot in `recursive_children`, which (because
+		// get_children does not filter reclaimed entries) caused the root
+		// lot's children_GB to keep counting the self_GB of every lot
+		// that ever existed under it -- even after the lot was
+		// expired/deleted/reclaimed and its accounting tie to its paths
+		// was severed in update_usage_by_dirs. With three back-to-back
+		// generations of lots over the same paths, root.children_GB grew
+		// to 3x the actual live usage.
+		//
+		// Mirror the LEFT JOIN reclamations idiom used elsewhere in this
+		// file (e.g. get_lot_from_dir, get_lots_from_dir). Any row in the
+		// reclamations table is treated as currently reclaimed; this
+		// function is called at recompute time and has no query_time
+		// parameter, so the "as of now" semantics are the right ones.
+		std::string sum_query = "SELECT COALESCE(SUM(lu.self_GB), 0), "
+								"COALESCE(SUM(lu.self_GB_being_written), 0), "
+								"COALESCE(SUM(lu.self_objects), 0), "
+								"COALESCE(SUM(lu.self_objects_being_written), 0) "
+								"FROM lot_usage lu "
+								"LEFT JOIN reclamations r ON r.lot_name = lu.lot_name "
+								"WHERE r.lot_name IS NULL "
+								"AND lu.lot_name IN (";
 
 		// For each child we need to update both the query and the str map
 		for (int i = 0; i < recursive_children.size(); i++) {
@@ -3045,8 +3066,10 @@ std::pair<std::vector<std::string>, std::string> lotman::Lot::list_all_lots() {
 	}
 }
 
-std::pair<std::vector<std::string>, std::string>
-lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursive, int64_t query_time) {
+std::pair<std::vector<std::string>, std::string> lotman::Lot::get_lots_from_dir(const std::string &dir_input,
+																				const bool recursive,
+																				int64_t query_time,
+																				bool for_attribution) {
 	// Normalize: ensure input dir has trailing slash for consistent comparison
 	// Database paths always have trailing slashes (e.g., "/foo/bar/")
 	std::string dir = ensure_trailing_slash(dir_input);
@@ -3115,9 +3138,68 @@ lotman::Lot::get_lots_from_dir(const std::string &dir_input, const bool recursiv
 	}
 
 	std::vector<std::string> matching_lots_vec;
-	if (rp.first.empty()) { // No associated lots were found, indicating the directory should be associated with the
-							// default lot
-		matching_lots_vec = {"default"};
+	if (rp.first.empty()) { // No associated lots were found
+		// Attribution-mode fallback: bytes physically present in a covered
+		// namespace must not be stranded on the default lot just because no
+		// generation is active for the path at this exact instant (typical
+		// during a rotation gap or before the very first generation has
+		// been minted at process startup). Re-run the longest-prefix path
+		// match without the active-window restriction. Reclaimed lots are
+		// still excluded.
+		if (for_attribution) {
+			std::string fallback_query = "SELECT p.lot_name FROM paths p "
+										 "JOIN management_policy_attributes mpa ON p.lot_name = mpa.lot_name "
+										 "LEFT JOIN reclamations r ON r.lot_name = p.lot_name "
+										 "WHERE "
+										 "(p.path = ?1 OR ?2 LIKE p.path || '%') "
+										 "AND (p.recursive OR p.path = ?3) "
+										 "AND p.exclude = 0 "
+										 "AND (r.lot_name IS NULL OR r.reclaimed_at > ?4) "
+										 "AND NOT EXISTS ( "
+										 "    SELECT 1 FROM paths e "
+										 "    WHERE e.lot_name = p.lot_name "
+										 "    AND e.exclude = 1 "
+										 "    AND (e.path = ?1 OR ?2 LIKE e.path || '%') "
+										 "    AND (e.recursive OR e.path = ?3) "
+										 "    AND LENGTH(e.path) > LENGTH(p.path) "
+										 ") "
+										 // Tie-break order:
+										 //   1. Longest matching path wins (most specific prefix).
+										 //   2. Prefer a lot whose creation_time is already <=
+										 //      query_time over one whose creation_time is in
+										 //      the future. Bytes physically present on disk
+										 //      could only have been written by a generation that
+										 //      existed at or before query_time; a not-yet-minted
+										 //      future generation never owned them. This matters
+										 //      in the rotation-gap case where Gen A just ended
+										 //      and Gen B starts shortly after query_time --
+										 //      attribute to Gen A (which actually wrote the
+										 //      bytes) rather than Gen B (which has not yet
+										 //      existed).
+										 //   3. Among lots on the preferred side, pick the one
+										 //      whose creation_time is numerically closest to
+										 //      query_time. Sentinel (all-zero) lots have
+										 //      creation_time=0 so they rank as "very far" from
+										 //      any realistic query_time, which is the desired
+										 //      behavior (prefer concrete generations over the
+										 //      always-live sentinel).
+										 "ORDER BY LENGTH(p.path) DESC, "
+										 "         CASE WHEN mpa.creation_time <= ?4 THEN 0 ELSE 1 END ASC, "
+										 "         ABS(mpa.creation_time - ?4) ASC "
+										 "LIMIT 1;";
+			auto fb_rp = lotman::db::SQL_get_matches(fallback_query, dir_str_map, dir_int_map);
+			if (!fb_rp.second.empty()) {
+				std::string int_err = fb_rp.second;
+				std::string ext_err = "Failure on call to SQL_get_matches (attribution fallback): ";
+				return std::make_pair(std::vector<std::string>(), ext_err + int_err);
+			}
+			if (!fb_rp.first.empty()) {
+				matching_lots_vec = fb_rp.first;
+			}
+		}
+		if (matching_lots_vec.empty()) {
+			matching_lots_vec = {"default"};
+		}
 	} else {
 		matching_lots_vec = rp.first;
 	}
