@@ -409,8 +409,26 @@ class Lot {
 	// Returns (true, "") if alive, (false, "") if not alive, or (false, error) on failure.
 	static std::pair<bool, std::string> is_lot_alive(const std::string &lot_name);
 	static std::pair<std::vector<std::string>, std::string> list_all_lots();
-	static std::pair<std::vector<std::string>, std::string> get_lots_from_dir(const std::string &dir,
-																			  const bool recursive, int64_t query_time);
+	// Resolve which lot owns a given directory at a given instant.
+	//
+	// When for_attribution=false (default, public API semantics): only lots
+	// whose [creation_time, expiration_time) window contains query_time are
+	// considered. If none exists, the result is {"default"}.
+	//
+	// When for_attribution=true: the active-window restriction is treated
+	// as a *preference* rather than a hard filter. The longest-prefix lot
+	// that owns the path at query_time wins as before; if no such lot
+	// exists but some lot owns the path at a *different* time (typical
+	// between UUID-lot generation rotations, or during early bootstrap
+	// before the first generation has been minted), the temporally
+	// closest such lot is returned instead of "default". This prevents
+	// on-disk bytes that semantically belong to a covered namespace from
+	// being permanently stranded on the default lot when the cache plugin
+	// happens to issue an absolute-mode usage update during a window in
+	// which no lot is currently active for the path. Reclamation still
+	// applies: reclaimed lots are never returned through this path.
+	static std::pair<std::vector<std::string>, std::string>
+	get_lots_from_dir(const std::string &dir, const bool recursive, int64_t query_time, bool for_attribution = false);
 
 	// Window-aware variant of get_lots_from_dir. Returns the union of every lot
 	// that "wins" the longest-prefix path-resolution contest at any instant in
@@ -571,8 +589,15 @@ class DirUsageUpdate : public Lot {
 				m_current_path = m_parent_prefix + path;
 			}
 
-			// Figure out which lot to associate with the dir
-			auto rp_vec_str = get_lots_from_dir(m_current_path, false, m_query_time);
+			// Figure out which lot to associate with the dir. for_attribution=true
+			// asks get_lots_from_dir to fall back to the temporally-closest
+			// covering lot (rather than "default") when no generation happens
+			// to be active at m_query_time for this path. Without this, bytes
+			// physically present in a covered namespace get permanently
+			// stranded on the default lot whenever the cache plugin's purge
+			// tick races with renewal-driven UUID rotation, or fires before
+			// the very first generation has been minted at process startup.
+			auto rp_vec_str = get_lots_from_dir(m_current_path, false, m_query_time, /*for_attribution=*/true);
 			if (!rp_vec_str.second.empty()) { // There was an error
 				std::string int_err = rp_vec_str.second;
 				std::string ext_err = "Failure on call to get_lots_from_dir: ";
@@ -643,7 +668,7 @@ class DirUsageUpdate : public Lot {
 						subdir_path = m_current_path + subdir["path"].get<std::string>();
 					}
 
-					auto subdir_lot_rp = get_lots_from_dir(subdir_path, false, m_query_time);
+					auto subdir_lot_rp = get_lots_from_dir(subdir_path, false, m_query_time, /*for_attribution=*/true);
 					if (subdir_lot_rp.second.empty() && !subdir_lot_rp.first.empty() &&
 						subdir_lot_rp.first[0] != lot.lot_name) {
 						// Subdir belongs to a different lot (e.g., due to exclusion)

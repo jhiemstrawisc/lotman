@@ -1,4 +1,4 @@
-add_executable(lotman-gtest main.cpp orm_tests.cpp migration_tests.cpp strict_hierarchy_tests.cpp reclamation_tests.cpp dynamic_ownership_tests.cpp ../src/lotman.cpp ../src/lotman_db.cpp ../src/lotman_internal.cpp)
+add_executable(lotman-gtest main.cpp orm_tests.cpp migration_tests.cpp strict_hierarchy_tests.cpp reclamation_tests.cpp dynamic_ownership_tests.cpp concurrency_tests.cpp attribution_tests.cpp ../src/lotman.cpp ../src/lotman_db.cpp ../src/lotman_internal.cpp)
 if( NOT LOTMAN_EXTERNAL_GTEST )
     add_dependencies(lotman-gtest gtest)
     include_directories("${PROJECT_SOURCE_DIR}/vendor/gtest/googletest/include")
