@@ -4,7 +4,7 @@
 %global srcname lotman
 
 Name: %srcname
-Version: 0.0.4
+Version: 0.1.0
 Release: 1%{?dist}
 Summary: C++ Implementation of the LotMan Library
 License: Apache-2.0
@@ -66,6 +66,12 @@ cd build
 %dir %{_includedir}/lotman
 
 %changelog
+* Tue May 19 2026 Justin Hiemstra <jhiemstra@wisc.edu> - 0.1.0-1
+- Significantly extend APIs to include query time arguments for lot timeline filtering
+- Introduce strict hierarchy mode and reservation semantics
+- Allow multiple lots to claim similar path if they don't intersect in time
+- Add connection pooling in the database layer
+
 * Wed Sep 18 2024 Justin Hiemstra <jhiemstra@wisc.edu> - 0.0.4-1
 - Add RPM specfile to project
 
